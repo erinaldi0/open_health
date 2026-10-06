@@ -148,6 +148,9 @@ class BleTransport(
     companion object {
         private const val HISTORY_FLUSH_BYTES = 32 * 1024
 
+        /** Logcat tag for raw frame dumps; see [onFrame]. ≤ 23 chars, as isLoggable requires. */
+        private const val FRAME_LOG_TAG = "BleFrames"
+
         /** The legacy writeDescriptor returns only a boolean; this stands in for `false`. */
         private const val STATUS_LEGACY_FALSE = -1
         private const val MAX_SUBSCRIBE_RETRIES = 5
@@ -608,7 +611,12 @@ class BleTransport(
     }
 
     private fun onFrame(c: BluetoothGattCharacteristic, value: ByteArray) {
-        android.util.Log.d("BleTransport", "Received frame on ${c.uuid}:${value.joinToString { "%02x".format(it) }}")
+        // Raw per-frame hex, for protocol captures (e.g. calibrating live HR). Off by default:
+        // a history sync is thousands of tiny frames. Enable without rebuilding with
+        //   adb shell setprop log.tag.BleFrames VERBOSE   (back off: … BleFrames INFO)
+        if (android.util.Log.isLoggable(FRAME_LOG_TAG, android.util.Log.VERBOSE)) {
+            android.util.Log.v(FRAME_LOG_TAG, "frame on ${c.uuid}: ${value.joinToString(" ") { "%02x".format(it) }}")
+        }
         if (value.isEmpty()) return
         if (isHistoryPayload(value)) {
             synchronized(lock) {
