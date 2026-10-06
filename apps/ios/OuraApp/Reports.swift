@@ -20,19 +20,131 @@ struct SleepMetrics {
 }
 
 // Mean HR/HRV per sleep stage — deep-sleep HRV is the recovery-relevant number. Mirror of
-// oura-summary `autonomic_by_stage` (which the iOS FFI leaves null under NoModelRunner).
-// iOS aligns the even-spread `series` to stages by index fraction rather than the server's
-// per-sample timestamps, so values can differ by a hair; see docs/clients.md.
-struct StageAutonomic {
+// oura-summary `autonomic_by_stage`. Uses per-sample timestamps (`series_t`) when present
+// so iOS and web assign every HR/HRV sample to the stage at its actual timestamp.
+struct StageAutonomic: Codable, Equatable {
     var hrvDeep: Double?; var hrvLight: Double?; var hrvRem: Double?
     var hrDeep: Double?; var hrLight: Double?; var hrRem: Double?
     var any: Bool { [hrvDeep, hrvLight, hrvRem, hrDeep, hrLight, hrRem].contains { $0 != nil } }
+    enum CodingKeys: String, CodingKey {
+        case hrvDeep = "hrv_deep", hrvLight = "hrv_light", hrvRem = "hrv_rem"
+        case hrDeep = "hr_deep", hrLight = "hr_light", hrRem = "hr_rem"
+    }
 }
 
 enum Sleep {
-    /// Mean of each stage's samples, mapping series index → stage by fraction of the night.
-    /// A single overnight HRV slope is intentionally not derived — nocturnal HRV is
-    /// stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery.
+    /// Maximum unobserved gap (seconds) bridged by a continuous signal line; longer
+    /// gaps break the line and area fill, matching `LANE_GAP_S` in `dashboard/web/app.js`.
+    static let laneGapSeconds: Double = 15 * 60
+
+    struct TimedSample: Equatable {
+        let unix: Double
+        let fraction: Double
+        let value: Double
+    }
+
+    /// Convert `[[unix_s, value]]` pairs into normalized night-window samples.
+    static func timedSamples(_ raw: [[Double]]?, startUnix: Int64?, endUnix: Int64?) -> [TimedSample]? {
+        guard let raw, !raw.isEmpty, let startUnix, let endUnix, endUnix > startUnix else { return nil }
+        let start = Double(startUnix), end = Double(endUnix), span = end - start
+        let samples: [TimedSample] = raw.compactMap { pair in
+            guard pair.count >= 2 else { return nil }
+            let t = pair[0], v = pair[1]
+            guard t.isFinite, v.isFinite, t >= start - 1e-6, t <= end + 1e-6 else { return nil }
+            let f = min(max((t - start) / span, 0), 1)
+            return TimedSample(unix: t, fraction: f, value: v)
+        }
+        return samples.isEmpty ? nil : samples
+    }
+
+    /// Split timestamped samples into contiguous segments separated by gaps > `maxGapSeconds`.
+    static func contiguousSegments(_ samples: [TimedSample], maxGapSeconds: Double = laneGapSeconds) -> [[TimedSample]] {
+        guard !samples.isEmpty else { return [] }
+        var segments: [[TimedSample]] = [[samples[0]]]
+        for sample in samples.dropFirst() {
+            if sample.unix - segments[segments.count - 1].last!.unix > maxGapSeconds {
+                segments.append([sample])
+            } else {
+                segments[segments.count - 1].append(sample)
+            }
+        }
+        return segments
+    }
+
+    /// Value of the sample nearest `fraction` within `toleranceSeconds`, or `nil` inside a gap / missing edge.
+    static func sampleAt(fraction: Double, in samples: [TimedSample], durationSeconds: Double,
+                         toleranceSeconds: Double = laneGapSeconds / 2) -> Double? {
+        guard durationSeconds > 0, !samples.isEmpty else { return nil }
+        guard let nearest = samples.min(by: { abs($0.fraction - fraction) < abs($1.fraction - fraction) }),
+              abs(nearest.fraction - fraction) * durationSeconds <= toleranceSeconds else {
+            return nil
+        }
+        return nearest.value
+    }
+
+    /// Preserve SleepNet's absolute 30-second grid instead of stretching its output.
+    static func alignedStages(timestamps: [Int64], stages: [Int], startMs: Int64, endMs: Int64) -> [Int]? {
+        guard timestamps.count == stages.count, endMs > startMs,
+              endMs - startMs <= 48 * 3600 * 1000,
+              stages.allSatisfy({ (1...4).contains($0) }),
+              zip(timestamps, timestamps.dropFirst()).allSatisfy({ $0 < $1 }) else { return nil }
+        // SleepNet stamps each epoch with its END time: the first output is start+30 s
+        // and the last lands on (or just past) the bedtime end. Epoch k covers
+        // (t-30 s, t]; reading t as the start left epoch 0 unknown and dropped the
+        // last one, so every night was reported incomplete. Mirrors
+        // tools/sleep_inputs.py.
+        let span = endMs - startMs
+        var aligned = Array(repeating: 0, count: max(1, Int((span + 29_999) / 30_000)))
+        for (timestamp, stage) in zip(timestamps, stages) {
+            guard timestamp > startMs else { continue }
+            let index = Int((timestamp - startMs - 1) / 30_000)
+            if index < aligned.count { aligned[index] = stage }
+        }
+        return aligned
+    }
+
+    /// Mean of each stage's HR and HRV samples using actual sample timestamps (`series_t`).
+    /// Mirrors `oura-summary::autonomic_by_stage`.
+    static func autonomic(hrTimed: [[Double]], hrvTimed: [[Double]],
+                          startUnix: Int64, endUnix: Int64, stages: [Int]) -> StageAutonomic {
+        guard !stages.isEmpty, endUnix > startUnix else { return StageAutonomic() }
+        let start = Double(startUnix), span = Double(endUnix - startUnix)
+        func means(_ pts: [[Double]]) -> [Int: Double] {
+            var sum: [Int: Double] = [:], cnt: [Int: Int] = [:]
+            for pair in pts where pair.count >= 2 {
+                let t = pair[0], v = pair[1]
+                guard v > 0, t.isFinite, v.isFinite else { continue }
+                let f = (t - start) / span
+                guard f >= -1e-9, f <= 1 + 1e-9 else { continue }
+                let clamped = min(max(f, 0), 1)
+                let idx = min(Int((clamped + 1e-9) * Double(stages.count)), stages.count - 1)
+                let s = stages[idx]
+                sum[s, default: 0] += v; cnt[s, default: 0] += 1
+            }
+            return cnt.reduce(into: [:]) { $0[$1.key] = (sum[$1.key]! / Double($1.value)).rounded() }
+        }
+        let h = means(hrTimed), v = means(hrvTimed)
+        return StageAutonomic(hrvDeep: v[1], hrvLight: v[2], hrvRem: v[3],
+                              hrDeep: h[1], hrLight: h[2], hrRem: h[3])
+    }
+
+    /// Resolve stage-specific HR and HRV averages for `night`, preferring timestamped
+    /// `series_t` samples, then precomputed `night.autonomic`, and finally flat `series`
+    /// only for legacy cached summaries without timestamps.
+    static func autonomic(night: NightRow, stages: [Int]) -> StageAutonomic {
+        if let timed = night.series_t,
+           (!timed.hr.isEmpty || !timed.hrv.isEmpty),
+           let startUnix = night.start_unix, let endUnix = night.end_unix, endUnix > startUnix {
+            return autonomic(hrTimed: timed.hr, hrvTimed: timed.hrv,
+                             startUnix: startUnix, endUnix: endUnix, stages: stages)
+        }
+        if let precomputed = night.autonomic, precomputed.any {
+            return precomputed
+        }
+        return autonomic(hr: night.series?.hr ?? [], hrv: night.series?.hrv ?? [], stages: stages)
+    }
+
+    /// Legacy fallback when `series_t` is unavailable: maps series index → stage by fraction of the night.
     static func autonomic(hr: [Double], hrv: [Double], stages: [Int]) -> StageAutonomic {
         func means(_ series: [Double]) -> [Int: Double] {
             guard series.count > 1, stages.count > 0 else { return [:] }
@@ -55,6 +167,7 @@ enum Sleep {
         guard v.count >= win, win >= 3 else { return v }
         let half = win / 2
         return v.indices.map { i in
+            if v[i] == 0 { return 0 }
             let a = max(0, i - half), b = min(v.count, i + half + 1)
             var counts = [0, 0, 0, 0, 0]
             for s in v[a..<b] where (1...4).contains(s) { counts[s] += 1 }
@@ -93,7 +206,7 @@ enum Sleep {
 
     static func metrics(_ stages: [Int], inBedS: Double) -> SleepMetrics? {
         let n = stages.count
-        guard n > 0 else { return nil }
+        guard n > 0, inBedS > 0, stages.allSatisfy({ (1...4).contains($0) }) else { return nil }
         let epochMin = inBedS / 60.0 / Double(n)
         let isSleep = { (c: Int) in (1...3).contains(c) }
         guard let onset = stages.firstIndex(where: isSleep),
@@ -132,9 +245,220 @@ enum Sleep {
     /// asleep seconds for a night from its (smoothed) stages.
     static func asleepS(_ stages: [Int], inBedS: Double) -> Int {
         let n = stages.count
-        guard n > 0 else { return 0 }
+        guard n > 0, stages.allSatisfy({ (1...4).contains($0) }) else { return 0 }
         let epochS = inBedS / Double(n)
         return Int(Double(stages.filter { (1...3).contains($0) }.count) * epochS)
+    }
+
+    private static func percentile(_ values: [Double], _ q: Double) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let pos = min(max(q, 0), 1) * Double(sorted.count - 1)
+        let lo = Int(pos.rounded(.down)), hi = Int(pos.rounded(.up))
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - Double(lo))
+    }
+
+    private static func epochSignalGrid(night: NightRow, count n: Int) -> (hr: [Double?], hrv: [Double?], motion: [Double])? {
+        guard n >= 20 else { return nil }
+        let startS = Double(night.start_unix ?? 0)
+        let endS = Double(night.end_unix ?? Int64(night.durationS.rounded()))
+        let spanS = endS > startS ? (endS - startS) : max(night.durationS, Double(n * 30))
+        guard spanS > 0 else { return nil }
+        let stepS = spanS / Double(n)
+
+        func interpolate(_ pts: [[Double]], fallback: [Double], maxHoldS: Double) -> [Double?] {
+            var pairs: [(Double, Double)] = pts.compactMap { p in
+                guard p.count >= 2, p[0].isFinite, p[1].isFinite, p[1] > 0 else { return nil }
+                return (p[0], p[1])
+            }
+            if pairs.isEmpty, fallback.count > 1 {
+                pairs = fallback.enumerated().compactMap { i, v in
+                    guard v.isFinite, v > 0 else { return nil }
+                    let t = startS + spanS * Double(i) / Double(fallback.count - 1)
+                    return (t, v)
+                }
+            }
+            guard !pairs.isEmpty else { return Array(repeating: nil, count: n) }
+            pairs.sort { $0.0 < $1.0 }
+            var out = Array(repeating: Double?.none, count: n)
+            var cursor = 0
+            for idx in 0..<n {
+                let center = startS + (Double(idx) + 0.5) * stepS
+                while cursor + 1 < pairs.count && pairs[cursor + 1].0 <= center {
+                    cursor += 1
+                }
+                var best = pairs[cursor]
+                if cursor + 1 < pairs.count, abs(pairs[cursor + 1].0 - center) < abs(best.0 - center) {
+                    best = pairs[cursor + 1]
+                }
+                if abs(best.0 - center) <= maxHoldS {
+                    out[idx] = best.1
+                }
+            }
+            return out
+        }
+
+        let hr = interpolate(night.series_t?.hr ?? [], fallback: night.series?.hr ?? [], maxHoldS: 450)
+        let hrv = interpolate(night.series_t?.hrv ?? [], fallback: night.series?.hrv ?? [], maxHoldS: 450)
+        var motion = Array(repeating: 0.0, count: n)
+        if let timedMotion = night.series_t?.motion, !timedMotion.isEmpty {
+            for p in timedMotion where p.count >= 2 && p[0].isFinite && p[1].isFinite {
+                let f = (p[0] - startS) / spanS
+                guard f >= -1e-6 && f <= 1 + 1e-6 else { continue }
+                let idx = min(max(Int(f * Double(n)), 0), n - 1)
+                if p[1] > motion[idx] { motion[idx] = p[1] }
+            }
+        } else if let mVals = night.series?.motion, !mVals.isEmpty {
+            let mTimes = night.series?.motion_time
+            for (i, v) in mVals.enumerated() where v.isFinite {
+                let f: Double
+                if let mTimes, i < mTimes.count { f = mTimes[i] }
+                else { f = Double(i) / Double(max(1, mVals.count - 1)) }
+                let idx = min(max(Int(f * Double(n)), 0), n - 1)
+                if v > motion[idx] { motion[idx] = v }
+            }
+        }
+        return (hr, hrv, motion)
+    }
+
+    /// Recover physiological N3 (Deep) bouts when Oura Gen 4 sparse IBI streams cause
+    /// SleepNet to collapse N3 into N2 (0% Deep across a full night). Mirrors
+    /// `oura-summary::refine_deep_stages`.
+    static func refineDeepStages(stages: [Int], night: NightRow) -> [Int] {
+        let n = stages.count
+        guard n >= 40,
+              stages.allSatisfy({ (1...4).contains($0) }),
+              !stages.contains(1),
+              stages.filter({ $0 == 2 }).count >= 20,
+              let grid = epochSignalGrid(night: night, count: n) else {
+            return stages
+        }
+        let hrValid = grid.hr.compactMap { $0 }
+        guard hrValid.count >= 6 else { return stages }
+        let hrQ35 = percentile(hrValid, 0.35)
+        let hrQ50 = percentile(hrValid, 0.50)
+        let hrvValid = grid.hrv.compactMap { $0 }
+        let hrvQ45 = hrvValid.count >= 4 ? percentile(hrvValid, 0.45) : 0.0
+        let posMotion = grid.motion.filter { $0 > 0 }
+        let quietMotion = posMotion.isEmpty ? 2.0 : max(2.0, min(6.0, percentile(posMotion, 0.35)))
+
+        let candidates: [Bool] = (0..<n).map { idx in
+            guard stages[idx] == 2 else { return false }
+            let frac = Double(idx) / Double(max(1, n - 1))
+            guard frac <= 0.78, grid.motion[idx] <= quietMotion else { return false }
+            let lo = max(0, idx - 3), hi = min(n, idx + 4)
+            guard !(lo..<hi).contains(where: { stages[$0] == 4 || stages[$0] == 3 }),
+                  let h = grid.hr[idx] else { return false }
+            let hCap = frac <= 0.55 ? hrQ50 : hrQ35
+            guard h <= hCap + 0.5 else { return false }
+            let hrs = (lo..<hi).compactMap { grid.hr[$0] }
+            if hrs.count >= 3 {
+                let mean = hrs.reduce(0, +) / Double(hrs.count)
+                let variance = hrs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(hrs.count)
+                if variance.squareRoot() > 3.2 { return false }
+            }
+            if hrvQ45 > 0, let v = grid.hrv[idx], v < hrvQ45 * 0.75 && h > hrQ35 {
+                return false
+            }
+            return true
+        }
+
+        var smoothed = candidates
+        if n >= 3 {
+            for idx in 1..<(n - 1) {
+                if !smoothed[idx] && candidates[idx - 1] && candidates[idx + 1] && stages[idx] == 2 {
+                    smoothed[idx] = true
+                }
+            }
+        }
+        var refined = stages
+        let maxDeep = max(8, Int((Double(n) * 0.24).rounded()))
+        var assigned = 0
+        var idx = 0
+        while idx < n {
+            if smoothed[idx] {
+                var end = idx + 1
+                while end < n && smoothed[end] { end += 1 }
+                if end - idx >= 6 {
+                    for j in idx..<end where assigned < maxDeep {
+                        refined[j] = 1
+                        assigned += 1
+                    }
+                }
+                idx = end
+            } else {
+                idx += 1
+            }
+        }
+        return refined
+    }
+
+    /// Physiological 4-stage hypnogram estimator when Torch SleepNet cannot run on a night
+    /// (e.g. Gen 4 nights with sparse raw PPG beats or model failure) yet valid overnight
+    /// HR/HRV/temp/motion series are present. Mirrors `oura-summary::stage_night_from_signals`.
+    static func estimateStages(night: NightRow) -> [Int]? {
+        let spanS: Double
+        if let s = night.start_unix, let e = night.end_unix, e > s {
+            spanS = Double(e - s)
+        } else {
+            spanS = night.durationS
+        }
+        let n = Int((spanS / 30.0).rounded())
+        guard (40...1920).contains(n),
+              let grid = epochSignalGrid(night: night, count: n) else { return nil }
+        let hrValid = grid.hr.compactMap { $0 }
+        let hrvValid = grid.hrv.compactMap { $0 }
+        guard hrValid.count >= 6 || hrvValid.count >= 6 else { return nil }
+
+        let hrQ35 = hrValid.isEmpty ? 58.0 : percentile(hrValid, 0.35)
+        let hrQ65 = hrValid.isEmpty ? 64.0 : percentile(hrValid, 0.65)
+        let hrQ85 = hrValid.isEmpty ? 70.0 : percentile(hrValid, 0.85)
+        let hrvQ35 = hrvValid.isEmpty ? 30.0 : percentile(hrvValid, 0.35)
+        let hrvQ65 = hrvValid.isEmpty ? 50.0 : percentile(hrvValid, 0.65)
+        let posMotion = grid.motion.filter { $0 > 0 }
+        let wakeMotion = posMotion.isEmpty ? 12.0 : max(8.0, percentile(posMotion, 0.85))
+        let quietMotion = posMotion.isEmpty ? 2.0 : max(2.0, min(5.0, percentile(posMotion, 0.30)))
+
+        var rawStages = Array(repeating: 2, count: n)
+        for idx in 0..<n {
+            let frac = Double(idx) / Double(max(1, n - 1))
+            let m = grid.motion[idx]
+            let h = grid.hr[idx]
+            let v = grid.hrv[idx]
+            let edge = idx < 6 || idx + 6 >= n
+
+            let lo = max(0, idx - 3), hi = min(n, idx + 4)
+            let hrs = (lo..<hi).compactMap { grid.hr[$0] }
+            let hrStd: Double = {
+                guard hrs.count >= 3 else { return 1.5 }
+                let mean = hrs.reduce(0, +) / Double(hrs.count)
+                return (hrs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(hrs.count)).squareRoot()
+            }()
+
+            if m >= wakeMotion || (edge && m > quietMotion) || ((h ?? 0) >= hrQ85 + 2.0 && m > quietMotion) {
+                rawStages[idx] = 4
+                continue
+            }
+            let cyclePhase = sin(2.0 * .pi * (spanS * frac / 5400.0 - 0.25))
+            if frac >= 0.12 && m <= quietMotion * 1.5 && (hrStd >= 2.0 || (cyclePhase > 0.35 && (h ?? hrQ65) >= hrQ35)) {
+                if let v, v >= hrvQ65 && (h ?? hrQ65) > hrQ35 {
+                    rawStages[idx] = 3
+                    continue
+                } else if hrStd >= 2.2 && frac >= 0.20 {
+                    rawStages[idx] = 3
+                    continue
+                }
+            }
+            if frac <= 0.72 && m <= quietMotion && (h ?? (hrQ35 + 1.0)) <= hrQ35 + 0.5 && hrStd <= 2.5 {
+                if (v ?? hrvQ35) >= hrvQ35 * 0.85 {
+                    rawStages[idx] = 1
+                    continue
+                }
+            }
+            rawStages[idx] = 2
+        }
+        let smoothed = smooth(rawStages, 5)
+        return refineDeepStages(stages: smoothed, night: night)
     }
 }
 
@@ -145,12 +469,15 @@ extension Summary {
     func stagedSleepDebt() -> SleepDebtSummary? {
         let defaultNeedS = 8.0 * 3600.0
         var byDay: [String: Double] = [:]
-        for n in nights where (n.stages?.count ?? 0) > 1 {
+        var incompleteDays = Set<String>()
+        for n in nights {
             guard let day = wakeYmd(n) else { continue }
-            let actual = Double(Sleep.asleepS(Sleep.smooth(n.stages ?? [], 5),
-                                              inBedS: (n.in_bed_h ?? 0) * 3600))
+            guard n.stagingComplete else { incompleteDays.insert(day); continue }
+            let actual = Double(Sleep.asleepS(Sleep.smooth(n.hypnogram ?? [], 5),
+                                              inBedS: n.durationS))
             if actual > 0 { byDay[day, default: 0] += actual }
         }
+        byDay = byDay.filter { !incompleteDays.contains($0.key) }
         guard let anchor = byDay.keys.max() else { return nil }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
@@ -252,25 +579,50 @@ struct Polysomnograph: View {
     private let axisH: CGFloat = 18
 
     private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]? }
-    private struct SignalLane { let v: [Double]; let color: Color; let dp: Int; let span: [Double] }
+    private struct SignalLane {
+        let v: [Double]
+        let color: Color
+        let dp: Int
+        let span: [Double]
+        var times: [Double]? = nil
+        var timed: [Sleep.TimedSample]? = nil
+    }
 
     private var lanes: [Lane] {
         var out: [Lane] = []
-        if let st = night.stages, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: Sleep.smooth(st, 5))) }
+        if let st = night.hypnogram, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: Sleep.smooth(st, 5))) }
         func sig(_ label: String, _ unit: String, _ v: [Double]?, _ color: Color,
-                 _ dp: Int = 0, span: [Double]? = nil) {
+                 _ dp: Int = 0, span: [Double]? = nil, times: [Double]? = nil,
+                 rawTimed: [[Double]]? = nil) {
+            if let timed = Sleep.timedSamples(rawTimed, startUnix: night.start_unix, endUnix: night.end_unix),
+               timed.count > 1 {
+                let vals = timed.map(\.value)
+                let coverage = [timed.first!.fraction, timed.last!.fraction]
+                out.append(Lane(label: label, unit: unit,
+                                signal: SignalLane(v: vals, color: color, dp: dp,
+                                                   span: coverage, timed: timed), stages: nil))
+                return
+            }
             guard let v, v.count > 1 else { return }
             let coverage = span.flatMap { $0.count == 2 ? $0 : nil } ?? [0, 1]
             out.append(Lane(label: label, unit: unit,
                             signal: SignalLane(v: v, color: color, dp: dp,
-                                               span: coverage), stages: nil))
+                                               span: coverage, times: times), stages: nil))
         }
         let s = night.series
-        sig("Heart rate", "bpm", s?.hr, Obs.chart)
-        sig("HRV", "ms", s?.hrv, Obs.chart)
-        sig("Blood O₂", "%", s?.spo2, Obs.chart)
-        sig("Skin temp", "°C", s?.temp, Obs.chart, 1, span: s?.temp_span)
-        sig("Motion", "s", s?.motion, Obs.chart)
+        let st = night.series_t
+        sig("Heart rate", "bpm", s?.hr, Obs.chart, rawTimed: st?.hr)
+        sig("HRV", "ms", s?.hrv, Obs.chart, rawTimed: st?.hrv)
+        sig("Blood O₂", "%", s?.spo2, Obs.chart, rawTimed: st?.spo2)
+        sig("Skin temp", "°C", s?.temp, Obs.chart, 1, span: s?.temp_span, rawTimed: st?.temp)
+        // Prefer timestamped motion (`series_t.motion`), falling back to `series.motion_time`.
+        // Legacy exports lost motion timestamps; do not invent their positions.
+        if let timedMotion = Sleep.timedSamples(st?.motion, startUnix: night.start_unix, endUnix: night.end_unix),
+           timedMotion.count > 1 {
+            sig("Motion", "s", timedMotion.map(\.value), Obs.chart, times: timedMotion.map(\.fraction))
+        } else if let times = s?.motion_time, times.count == s?.motion.count {
+            sig("Motion", "s", s?.motion, Obs.chart, times: times)
+        }
         return out
     }
 
@@ -319,7 +671,7 @@ struct Polysomnograph: View {
             .frame(width: gutterW, alignment: .leading)
             Group {
                 if let st = lane.stages { HypnoCanvas(stages: st) }
-                else if let s = lane.signal { SignalCanvas(v: s.v, color: s.color, span: s.span) }
+                else if let s = lane.signal { SignalCanvas(v: s.v, color: s.color, span: s.span, times: s.times, timed: s.timed) }
             }
             .frame(width: plotW, height: h)
         }
@@ -335,7 +687,16 @@ struct Polysomnograph: View {
         guard let s = lane.signal else { return "" }
         let fmt = { (x: Double) in s.dp > 0 ? String(format: "%.\(s.dp)f", x) : String(Int(x.rounded())) }
         if let f = cursorF {
-            guard f >= s.span[0], f <= s.span[1] else { return "—" }
+            if let timed = s.timed {
+                guard let val = Sleep.sampleAt(fraction: f, in: timed, durationSeconds: night.durationS) else { return "–" }
+                return "\(fmt(val)) \(lane.unit)"
+            }
+            guard f >= s.span[0], f <= s.span[1] else { return "–" }
+            if let times = s.times {
+                guard let index = times.indices.min(by: { abs(times[$0] - f) < abs(times[$1] - f) }),
+                      abs(times[index] - f) * night.durationS <= 30 else { return "–" }
+                return "\(fmt(s.v[index])) \(lane.unit)"
+            }
             let local = (f - s.span[0]) / max(1e-9, s.span[1] - s.span[0])
             let v = s.v[min(s.v.count - 1, max(0, Int(local * Double(s.v.count - 1))))]
             return "\(fmt(v)) \(lane.unit)"
@@ -377,7 +738,9 @@ private struct HypnoCanvas: View {
             }
             var i = 0; var prev: CGFloat? = nil
             while i < n {
-                let code = stages[i]; var j = i
+                let code = stages[i]
+                if code == 0 { prev = nil; i += 1; continue }
+                var j = i
                 while j < n, stages[j] == code { j += 1 }
                 let x1 = xOf(i), x2 = xOf(min(j, n - 1)), y = yOf(lvl(code))
                 if let p = prev {
@@ -397,11 +760,59 @@ private struct SignalCanvas: View {
     let v: [Double]
     let color: Color
     let span: [Double]
+    var times: [Double]? = nil
+    var timed: [Sleep.TimedSample]? = nil
     var body: some View {
         Canvas { ctx, size in
             guard v.count > 1 else { return }
+            if let times, times.count == v.count {
+                let lo = min(0, v.min()!), hi = max(lo + 1, v.max()!)
+                for i in v.indices {
+                    let x = size.width * CGFloat(times[i])
+                    let y = 5 + (1 - CGFloat((v[i] - lo) / (hi - lo))) * (size.height - 10)
+                    ctx.stroke(Path { $0.move(to: CGPoint(x: x, y: size.height - 5)); $0.addLine(to: CGPoint(x: x, y: y)) },
+                               with: .color(color), lineWidth: 1.5)
+                }
+                return
+            }
             let lo = v.min()!, hi = v.max()!, rng = max(hi - lo, 1e-6)
             let pad: CGFloat = 5
+            if let timed, timed.count > 1 {
+                func pt(_ s: Sleep.TimedSample) -> CGPoint {
+                    CGPoint(x: size.width * CGFloat(s.fraction),
+                            y: pad + (1 - CGFloat((s.value - lo) / rng)) * (size.height - 2 * pad))
+                }
+                for seg in Sleep.contiguousSegments(timed) {
+                    var line = Path()
+                    let first = pt(seg[0])
+                    line.move(to: first)
+                    if seg.count == 1 {
+                        let endX = min(size.width, first.x + 1.5)
+                        line.addLine(to: CGPoint(x: endX, y: first.y))
+                        var area = line
+                        area.addLine(to: CGPoint(x: endX, y: size.height))
+                        area.addLine(to: CGPoint(x: first.x, y: size.height))
+                        area.closeSubpath()
+                        ctx.fill(area, with: .color(color.opacity(0.10)))
+                    } else {
+                        for sample in seg.dropFirst() { line.addLine(to: pt(sample)) }
+                        let last = pt(seg.last!)
+                        var area = line
+                        area.addLine(to: CGPoint(x: last.x, y: size.height))
+                        area.addLine(to: CGPoint(x: first.x, y: size.height))
+                        area.closeSubpath()
+                        ctx.fill(area, with: .color(color.opacity(0.10)))
+                    }
+                    ctx.stroke(line, with: .color(color), lineWidth: 1.3)
+                }
+                let x0 = size.width * CGFloat(timed.first!.fraction)
+                let x1 = size.width * CGFloat(timed.last!.fraction)
+                let mean = v.reduce(0, +) / Double(v.count)
+                let my = pad + (1 - CGFloat((mean - lo) / rng)) * (size.height - 2 * pad)
+                ctx.stroke(Path { $0.move(to: CGPoint(x: x0, y: my)); $0.addLine(to: CGPoint(x: x1, y: my)) },
+                           with: .color(color.opacity(0.4)), style: StrokeStyle(lineWidth: 0.6, dash: [3, 3]))
+                return
+            }
             func pt(_ i: Int) -> CGPoint {
                 CGPoint(x: size.width * CGFloat(span[0] + (span[1] - span[0]) * Double(i) / Double(v.count - 1)),
                         y: pad + (1 - CGFloat((v[i] - lo) / rng)) * (size.height - 2 * pad))
@@ -450,7 +861,7 @@ private func hourTicks(_ win: (a: Int, b: Int, span: Int)) -> [Int] {
     while t <= win.b { out.append(t); t += 60 }
     return out
 }
-private func stageName(_ c: Int) -> String { switch c { case 1: return "Deep"; case 2: return "Light"; case 3: return "REM"; default: return "Awake" } }
+private func stageName(_ c: Int) -> String { switch c { case 1: return "Deep"; case 2: return "Light"; case 3: return "REM"; case 4: return "Awake"; default: return "No data" } }
 
 private func debtDuration(_ minutes: Double) -> String {
     let m = max(0, Int(minutes.rounded()))
@@ -486,172 +897,242 @@ struct SleepDebtCard: View {
                     Text(debtStateCopy(debt.state)).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("\(debt.valid_days) of 5 days available").font(Obs.mono(18, .medium)).foregroundStyle(Obs.ink)
-                    Text("5 days of sleep data are needed within the past 2 weeks.")
-                        .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                    Text("\(debt.valid_days) of 5 nights").font(Obs.mono(14, .medium)).foregroundStyle(Obs.ink2)
+                    Text("Needs 5 nights of sleep in the past 2 weeks.")
+                        .font(Obs.mono(11)).foregroundStyle(Obs.muted)
                 }
             }
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).obsCard()
+        .buttonStyle(.plain)
     }
 }
 
-// Symptom Radar — on-device illness detection. A radar blip for the traffic-light
-// status, then each biomarker plotted against its personal baseline band so you see
-// at a glance how far breathing / lowest HR / HRV / temperature sit from normal.
-struct IllnessCard: View {
-    let illness: IllnessResult
-    static var coral: Color { Obs.alert }
-    private static let copy = [
-        "NO_SIGNS": "No signs of illness. Your biometrics are sitting within your normal range.",
-        "MINOR_SIGNS": "Minor signs — a few biometrics have drifted outside your usual range. Worth an easy day.",
-        "MAJOR_SIGNS": "Major signs — several biometrics are elevated. Your body may be fighting something.",
-    ]
-    private static let label = ["NO_SIGNS": "No signs", "MINOR_SIGNS": "Minor signs", "MAJOR_SIGNS": "Major signs"]
-    private static let bmName = [
-        "AverageBreath": "Breathing", "LowestHeartRate": "Lowest HR",
-        "AverageHrv": "HRV", "TemperatureDeviation": "Body temp",
-    ]
-    private static let bmUnit = [
-        "AverageBreath": "br", "LowestHeartRate": "bpm", "AverageHrv": "ms", "TemperatureDeviation": "°C",
-    ]
-    // display order matching Oura's card (breath, lowest HR, HRV, temperature)
-    private static let order = ["AverageBreath", "LowestHeartRate", "AverageHrv", "TemperatureDeviation"]
+// A readable summary first; personal ranges are available on demand.
+/// The literature-based sleep score, with its components opened up.
+///
+/// The number matters less than the breakdown: every component names the paper its
+/// thresholds came from, so a bad score can be argued with rather than believed.
+struct SleepScoreCard: View {
+    let score: SleepScore
+    var breathRate: Double? = nil
+    @State private var expanded = false
 
     private var tint: Color {
-        switch illness.trafficLight {
-        case "MINOR_SIGNS": return Obs.bad
-        case "MAJOR_SIGNS": return Self.coral
-        default: return Obs.good
+        switch score.score {
+        case 85...: return Obs.good
+        case 70..<85: return Obs.chart
+        default: return Obs.bad
         }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                ObsTag("symptom radar")
-                Spacer()
-                if illness.available {
-                    Text("\(illness.daysWithData)/30d").font(Obs.mono(10)).foregroundStyle(Obs.trace)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(Int(score.score))")
+                    .font(Obs.mono(38, .medium)).foregroundStyle(tint).monospacedDigit()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("/ 100").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                    Text(score.basis ?? "published norms")
+                        .font(Obs.mono(9)).foregroundStyle(Obs.muted)
                 }
-            }
-            if !illness.available {
-                Text(illness.status == "MISSING_LAST_NIGHT_SLEEP"
-                     ? "Wear the ring overnight and sync — last night's data is missing."
-                     : "Needs more recent nights (at least 7 of the last 14).")
-                    .font(Obs.prose(14)).foregroundStyle(Obs.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 14)
-            } else {
-                // status: radar blip + word
-                HStack(spacing: 13) {
-                    RadarBlip(tint: tint)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(Self.label[illness.trafficLight] ?? "—")
-                            .font(Obs.prose(20, .semibold)).foregroundStyle(Obs.ink)
-                        Text("illness signals").font(Obs.mono(9)).tracking(1.5)
-                            .foregroundStyle(tint)
+                Spacer()
+                if let breathRate {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(String(format: "%.1f", breathRate))
+                            .font(Obs.mono(15, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
+                        Text("br/min").font(Obs.mono(9)).foregroundStyle(Obs.muted)
                     }
                 }
-                .padding(.top, 16)
+            }
 
-                Text(Self.copy[illness.status] ?? "").font(Obs.prose(13.5)).foregroundStyle(Obs.ink2)
-                    .lineSpacing(2).fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 12)
-
-                Rectangle().fill(Obs.trace.opacity(0.28)).frame(height: 0.5)
-                    .padding(.top, 16)
-
-                let byType = Dictionary(uniqueKeysWithValues: illness.biomarkers.map { ($0.type, $0) })
-                VStack(spacing: 13) {
-                    ForEach(Self.order, id: \.self) { type in
-                        if let b = byType[type] {
-                            BiomarkerRow(name: Self.bmName[type] ?? type,
-                                         unit: Self.bmUnit[type] ?? "",
-                                         b: b, tint: tint)
+            ForEach(score.components) { component in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(component.label).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                        Spacer()
+                        Text("\(Int(component.score))")
+                            .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
+                    }
+                    // bar width is the component score; opacity is how much it counted
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Rectangle().fill(Obs.rule).frame(height: 3)
+                            Rectangle()
+                                .fill(Obs.chart.opacity(0.35 + 0.65 * min(1, component.weight * 3)))
+                                .frame(width: geo.size.width * component.score / 100, height: 3)
                         }
                     }
+                    .frame(height: 3)
+                    if expanded, let source = component.source {
+                        Text(source).font(Obs.mono(9)).foregroundStyle(Obs.muted)
+                    }
                 }
-                .padding(.top, 16)
-
-                Text("on-device illness model · \(illness.date)")
-                    .font(Obs.mono(9)).foregroundStyle(Obs.trace)
-                    .padding(.top, 16)
             }
+
+            Button { expanded.toggle() } label: {
+                Text(expanded ? "hide sources" : "show sources")
+                    .font(Obs.mono(10)).foregroundStyle(Obs.ink2)
+            }
+            .buttonStyle(.plain)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .obsCard()
     }
 }
 
-// concentric radar echo with a centre blip — the "Symptom Radar" motif.
-private struct RadarBlip: View {
-    let tint: Color
-    var body: some View {
-        ZStack {
-            Circle().strokeBorder(tint.opacity(0.18), lineWidth: 1).frame(width: 34, height: 34)
-            Circle().strokeBorder(tint.opacity(0.34), lineWidth: 1).frame(width: 22, height: 22)
-            Circle().fill(tint).frame(width: 9, height: 9)
+struct IllnessCard: View {
+    let illness: IllnessResult
+    @State private var showDetails = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let names = [
+        "AverageBreath": "Breathing rate", "LowestHeartRate": "Lowest heart rate",
+        "AverageHrv": "Heart rate variability", "TemperatureDeviation": "Temperature change",
+    ]
+    private static let units = [
+        "AverageBreath": "br/min", "LowestHeartRate": "bpm", "AverageHrv": "ms", "TemperatureDeviation": "°C",
+    ]
+    private static let order = ["AverageBreath", "LowestHeartRate", "AverageHrv", "TemperatureDeviation"]
+    private var tint: Color {
+        switch illness.trafficLight {
+        case "NO_SIGNS": return Obs.good
+        case "MINOR_SIGNS": return Obs.bad
+        case "MAJOR_SIGNS": return Obs.alert
+        default: return Obs.muted
         }
-        .frame(width: 34, height: 34)
+    }
+    private var status: String {
+        switch illness.trafficLight {
+        case "NO_SIGNS": return "No signs"
+        case "MINOR_SIGNS": return "Minor signs"
+        case "MAJOR_SIGNS": return "Major signs"
+        default: return "No result yet"
+        }
+    }
+    private var explanation: String {
+        switch illness.status {
+        case "NO_SIGNS":
+            // The decision comes from the model's overall score, not a count of flags:
+            // a night can have biometrics out of range and still not add up to strain.
+            let flagged = illness.biomarkers.filter(\.indicatesSymptoms).count
+            return flagged == 0
+                ? "Your overnight biometrics are within their usual ranges."
+                : "\(flagged == 1 ? "One overnight biometric is" : "\(flagged) overnight biometrics are") outside your usual range, but together they don’t match the pattern of your body fighting something."
+        case "MINOR_SIGNS": return "Some overnight biometrics are outside your usual ranges."
+        case "MAJOR_SIGNS": return "Several overnight biometrics are outside your usual ranges."
+        case "MISSING_LAST_NIGHT_SLEEP": return "Wear your ring overnight, then sync to see your latest result."
+        default: return "Your radar needs at least 7 nights of data from the last 14 days."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                ObsTag("symptom radar", icon: "waveform.path.ecg")
+                Spacer(minLength: 12)
+                Text(illness.date).font(Obs.mono(10)).foregroundStyle(Obs.ink2)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Label(illness.available ? status : "Getting to know you",
+                      systemImage: illness.available ? (illness.trafficLight == "NO_SIGNS" ? "checkmark.circle" : "waveform.path.ecg") : "moon")
+                    .font(Obs.mono(18, .medium))
+                    .foregroundStyle(illness.available ? tint : Obs.ink2)
+                Text(explanation).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if illness.available {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                        showDetails.toggle()
+                    }
+                } label: {
+                    HStack {
+                        Text(showDetails ? "Hide details" : "View details")
+                        Spacer()
+                        Image(systemName: showDetails ? "chevron.up" : "chevron.down")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .font(Obs.mono(12, .medium))
+                    .foregroundStyle(Obs.ink)
+                    .frame(minHeight: 32)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showDetails ? "Expanded" : "Collapsed")
+                .accessibilityHint("Shows overnight measurements and personal ranges")
+            }
+            if illness.available && showDetails {
+                Rectangle().fill(Obs.rule).frame(height: 1)
+                Text("Overnight measurements")
+                    .font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink)
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach(Self.order, id: \.self) { type in
+                        if let biomarker = illness.biomarkers.first(where: { $0.type == type }) {
+                            BiomarkerRow(name: Self.names[type] ?? type,
+                                         unit: Self.units[type] ?? "", biomarker: biomarker)
+                        }
+                    }
+                }
+                if illness.biomarkers.isEmpty {
+                    Text("Measurement details aren’t available for this result.")
+                        .font(.subheadline).foregroundStyle(Obs.muted)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Based on \(illness.daysWithData) nights in the past 30 days")
+                        .font(.caption).foregroundStyle(Obs.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-// one biomarker: name, a value dot placed on its personal baseline band, and the value.
 private struct BiomarkerRow: View {
     let name: String
     let unit: String
-    let b: IllnessBiomarker
-    let tint: Color
-    private var dotColor: Color {
-        guard b.indicatesSymptoms else { return Obs.ink }
-        return b.reason == "ELEVATED" ? IllnessCard.coral : Obs.bad
-    }
-    private func fmt(_ v: Double) -> String {
-        abs(v) < 10 && v != v.rounded() ? String(format: "%.1f", v) : String(Int(v.rounded()))
-    }
-    var body: some View {
-        HStack(spacing: 12) {
-            Text(name).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
-                .frame(width: 74, alignment: .leading)
-            RangeTrack(value: b.value, lower: b.lower, upper: b.upper,
-                       dot: dotColor, flagged: b.indicatesSymptoms)
-                .frame(height: 14)
-            HStack(alignment: .firstTextBaseline, spacing: 3) {
-                Text(fmt(b.value)).font(Obs.mono(13, .medium))
-                    .foregroundStyle(b.indicatesSymptoms ? dotColor : Obs.ink).monospacedDigit()
-                Text(unit).font(Obs.mono(9)).foregroundStyle(Obs.trace)
-            }
-            .frame(width: 56, alignment: .trailing)
-        }
-    }
-}
+    let biomarker: IllnessBiomarker
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-// a thin track with the normal [lower, upper] band highlighted and today's value as a
-// dot — the axis auto-frames to include both the band and the value.
-private struct RangeTrack: View {
-    let value, lower, upper: Double
-    let dot: Color
-    let flagged: Bool
+    private var change: String {
+        switch biomarker.reason {
+        case "ELEVATED": return "Above usual"
+        case "DECREASED": return "Below usual"
+        default: return "Outside usual range"
+        }
+    }
+    private func formatted(_ value: Double) -> String {
+        guard value.isFinite else { return "–" }
+        return unit == "°C"
+            ? value.formatted(.number.precision(.fractionLength(1)))
+            : value.formatted(.number.precision(.fractionLength(0...1)))
+    }
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width, midY = geo.size.height / 2
-            let pad = max((upper - lower) * 0.7, 1e-6)
-            let lo = min(lower, value) - pad, hi = max(upper, value) + pad
-            let span = max(hi - lo, 1e-6)
-            let x = { (v: Double) in CGFloat((v - lo) / span) * w }
-            ZStack(alignment: .leading) {
-                Capsule().fill(Obs.trace.opacity(0.22)).frame(height: 3).position(x: w / 2, y: midY)
-                Capsule().fill(Obs.chart.opacity(0.35))
-                    .frame(width: max(0, x(upper) - x(lower)), height: 3)
-                    .position(x: (x(lower) + x(upper)) / 2, y: midY)
-                Circle().fill(dot).frame(width: 9, height: 9)
-                    .overlay(Circle().stroke(Obs.base.opacity(0.9), lineWidth: 1.5))
-                    .shadow(color: flagged ? dot.opacity(0.6) : .clear, radius: 3)
-                    .position(x: min(max(x(value), 4.5), w - 4.5), y: midY)
+        VStack(alignment: .leading, spacing: 5) {
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
+                : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 12))
+            layout {
+                Text(name).font(.subheadline).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
+                Text("\(formatted(biomarker.value)) \(unit)")
+                    .font(.subheadline.weight(.medium)).monospacedDigit()
+                    .foregroundStyle(biomarker.indicatesSymptoms ? Obs.alert : Obs.ink)
+                    .fixedSize()
+            }
+            if biomarker.indicatesSymptoms {
+                Text(change).font(.caption).foregroundStyle(Obs.alert)
+            }
+            if biomarker.lower.isFinite && biomarker.upper.isFinite && biomarker.lower <= biomarker.upper {
+                Text("Personal range: \(formatted(biomarker.lower)) to \(formatted(biomarker.upper)) \(unit)")
+                    .font(.caption).foregroundStyle(Obs.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Personal range unavailable").font(.caption).foregroundStyle(Obs.muted)
             }
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -736,41 +1217,175 @@ struct SleepDebtDetail: View {
 }
 
 // ── the full-page report (sleep ⇄ activity) ──────────────────────────────────
+struct DayAnalysisContext {
+    var summary: Summary?
+    var isBusy: Bool
+    var refresh: (DayAnalysisRequest) async -> String?
+}
+
+private struct DayAnalysisContextKey: EnvironmentKey {
+    static let defaultValue: DayAnalysisContext? = nil
+}
+
+extension EnvironmentValues {
+    var dayAnalysis: DayAnalysisContext? {
+        get { self[DayAnalysisContextKey.self] }
+        set { self[DayAnalysisContextKey.self] = newValue }
+    }
+}
+
 struct DayReportView: View {
     let s: Summary
     let day: String
     @State var tab: Tab
     @Environment(\.dismiss) private var dismiss
-    enum Tab: String, CaseIterable { case sleep = "Sleep", activity = "Activity" }
+    @Environment(\.dayAnalysis) private var analysis
+    @State private var refreshing: Tab?
+    @State private var refreshMessages: [String: String] = [:]
+    @State private var exportFile: URL?
+    @State private var exportNote: String?
+    @State private var autoRefreshedDays: Set<String> = []
+    typealias Tab = DayAnalysisKind
 
     var body: some View {
         ZStack {
             Obs.canvas.ignoresSafeArea()
             VStack(spacing: 0) {
-                HStack(spacing: 14) {
+                HStack(spacing: 10) {
                     Button { dismiss() } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
-                            Text("Back").font(Obs.mono(13))
-                        }.foregroundStyle(Obs.ink2)
+                        Image(systemName: "chevron.left").font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Obs.ink2)
+                            .frame(width: 34, height: 34)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Back")
                     Text(day).font(Obs.mono(13, .medium)).foregroundStyle(Obs.ink)
-                    Spacer()
+                        .lineLimit(1).fixedSize()
+                    Spacer(minLength: 6)
                     Picker("", selection: $tab) {
                         ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented).fixedSize()
+                    if let analysis { refreshButton(analysis) }
+                    exportMenu
                 }
-                .padding(.horizontal, 20).padding(.vertical, 12)
+                .padding(.leading, 12).padding(.trailing, 14).padding(.vertical, 10)
                 .overlay(alignment: .bottom) { Rectangle().fill(Obs.trace.opacity(0.3)).frame(height: 0.5) }
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 26) {
-                        if tab == .sleep { SleepReport(s: s, day: day) }
-                        else { ActivityReport(s: s, day: day) }
+                        if let analysis, let note = refreshNote(analysis) {
+                            Text(note)
+                                .font(.footnote).foregroundStyle(Obs.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityAddTraits(.updatesFrequently)
+                        }
+                        if tab == .sleep { SleepReport(s: analysis?.summary ?? s, day: day) }
+                        else { ActivityReport(s: analysis?.summary ?? s, day: day) }
                     }
                     .padding(20).padding(.bottom, 60)
                 }
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .sheet(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } })) {
+            if let exportFile { DiagnosticsShare(url: exportFile) }
+        }
+        .task(id: "\(day)-\(tab.rawValue)") {
+            guard tab == .sleep,
+                  !autoRefreshedDays.contains(day),
+                  let analysis,
+                  !analysis.isBusy,
+                  refreshing == nil,
+                  let n = (analysis.summary ?? s).night(forDay: day),
+                  !n.hasHypnogram,
+                  n.hasSignals else { return }
+            autoRefreshedDays.insert(day)
+            refreshing = .sleep
+            let error = await analysis.refresh(DayAnalysisRequest(day: day, kind: .sleep))
+            if let error { refreshMessages[Tab.sleep.rawValue] = error }
+            refreshing = nil
+        }
+    }
+
+    /// Rerun the selected analysis for this day. Lives in the header as an icon so the
+    /// report itself starts right under the title.
+    private func refreshButton(_ analysis: DayAnalysisContext) -> some View {
+        Button {
+            let selected = tab
+            refreshing = selected
+            refreshMessages[selected.rawValue] = nil
+            Task {
+                let error = await analysis.refresh(DayAnalysisRequest(day: day, kind: selected))
+                refreshMessages[selected.rawValue] = error ?? "Analysis updated."
+                refreshing = nil
+            }
+        } label: {
+            Group {
+                if refreshing == tab { ProgressView().controlSize(.small) }
+                else { Image(systemName: "arrow.clockwise").font(.system(size: 15, weight: .medium)) }
+            }
+            .foregroundStyle(Obs.ink2)
+            .frame(width: 34, height: 34)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(refreshing != nil || analysis.isBusy)
+        .opacity(analysis.isBusy && refreshing == nil ? 0.4 : 1)
+        .accessibilityLabel(refreshing == tab ? "Refreshing \(tab.rawValue.lowercased()) analysis"
+                            : "Refresh \(tab.rawValue.lowercased()) analysis")
+    }
+
+    /// Only shown while a refresh runs or right after one, so the report keeps its space.
+    private func refreshNote(_ analysis: DayAnalysisContext) -> String? {
+        if let message = refreshMessages[tab.rawValue] { return message }
+        if refreshing == tab { return "Keep the app open while analysis runs." }
+        return nil
+    }
+
+    /// The day's data as JSON — copy for a quick paste, or share as a file. Built off
+    /// the main thread: a night carries its full signal series.
+    private var exportMenu: some View {
+        Menu {
+            Button { export(share: false) } label: { Label("Copy JSON", systemImage: "doc.on.doc") }
+            Button { export(share: true) } label: { Label("Share JSON…", systemImage: "square.and.arrow.up") }
+        } label: {
+            Image(systemName: exportNote == nil ? "square.and.arrow.up" : "checkmark")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Obs.ink2)
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .accessibilityLabel(exportNote ?? "Export \(tab.rawValue.lowercased()) data as JSON")
+    }
+
+    private func export(share: Bool) {
+        let summary = analysis?.summary ?? s
+        let selected = tab
+        Task {
+            let payload = DayExport(summary: summary, day: day, kind: selected)
+            let result: Result<URL?, Error> = await Task.detached {
+                Result {
+                    if payload.isEmpty { return nil }
+                    if share { return try payload.writeTemporaryFile() }
+                    DayExport.copyToPasteboard(try payload.json())
+                    return nil
+                }
+            }.value
+            switch result {
+            case .success(let url):
+                if payload.isEmpty { exportNote = "Nothing to export for this day."; refreshMessages[selected.rawValue] = exportNote }
+                else if let url { exportFile = url }
+                else { exportNote = "Copied" }
+            case .failure(let error):
+                dlog("export", "day \(day) \(selected.rawValue): \(error)")
+                refreshMessages[selected.rawValue] = "Couldn’t build the JSON export."
+            }
+            if exportNote != nil {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                exportNote = nil
             }
         }
     }
@@ -779,25 +1394,67 @@ struct DayReportView: View {
 struct SleepReport: View {
     let s: Summary
     let day: String
+    @Environment(\.dayAnalysis) private var analysis
+    @State private var editingBedtime = false
+    @State private var bedtimeDate = Date()
+    @State private var wakeupDate = Date()
+    @State private var savingBedtime = false
+
+    private static func dateFromHM(_ hm: String?) -> Date {
+        let parts = (hm ?? "23:00").split(separator: ":").compactMap { Int($0) }
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        comps.hour = parts.first ?? 23
+        comps.minute = parts.count > 1 ? parts[1] : 0
+        return Calendar.current.date(from: comps) ?? Date()
+    }
+
+    private static func hmFromDate(_ date: Date) -> String {
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return String(format: "%02d:%02d", comps.hour ?? 0, comps.minute ?? 0)
+    }
+
     var body: some View {
         if let n = s.night(forDay: day) {
-            let metrics = (n.stages.flatMap { st in Sleep.metrics(Sleep.smooth(st, 5), inBedS: (n.in_bed_h ?? 0) * 3600) })
+            let metrics = (n.hypnogram.flatMap { st in Sleep.metrics(Sleep.smooth(st, 5), inBedS: n.durationS) })
             let asleepH = metrics.map { $0.asleepMin / 60 }
 
             // summary strip
             HStack(alignment: .top, spacing: 0) {
-                Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "—", caption: "in bed")
-                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "—", caption: "asleep")
-                Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "—", caption: "efficiency")
-                Readout(value: "\(n.start ?? "—")–\(n.end ?? "—")", caption: "bedtime")
+                Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "–", caption: "in bed")
+                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
+                Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
+                Button {
+                    bedtimeDate = Self.dateFromHM(n.start)
+                    wakeupDate = Self.dateFromHM(n.end)
+                    editingBedtime.toggle()
+                } label: {
+                    Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")",
+                            caption: n.isBedtimeManual ? "bedtime · edited" : "bedtime · adjust",
+                            accent: editingBedtime ? Obs.chart : Obs.ink)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Adjust bedtime and wake-up time")
+            }
+
+            if editingBedtime {
+                bedtimeEditor(n)
+            }
+
+            if let score = n.sleep_score {
+                Rule("sleep score")
+                SleepScoreCard(score: score, breathRate: n.breath_rate)
             }
 
             if n.hasHypnogram {
-                Rule("overnight polysomnograph")
+                if !n.stagingComplete && n.hasHypnogram {
+                    Text("Incomplete sleep analysis. Gaps mean no data, not awake time; sleep metrics are withheld.")
+                        .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                }
+                Rule("Sleep stages & signals")
                 stageLegend
                 Polysomnograph(night: n)
 
-                Rule("sleep architecture")
+                Rule("Sleep stages")
                 StageBar(n: n)
                 HStack(spacing: 16) {
                     ForEach([("Deep", n.deep_pct), ("Light", n.light_pct), ("REM", n.rem_pct), ("Awake", n.wake_pct)], id: \.0) { name, pct in
@@ -807,27 +1464,100 @@ struct SleepReport: View {
                 }
                 if let m = metrics { clinicalGrid(m) }
 
-                let auto = Sleep.autonomic(hr: n.series?.hr ?? [], hrv: n.series?.hrv ?? [],
-                                           stages: Sleep.smooth(n.stages ?? [], 5))
+                let auto = Sleep.autonomic(night: n,
+                                           stages: Sleep.smooth(n.hypnogram ?? [], 5))
                 if auto.any {
-                    Rule("autonomic recovery by stage")
+                    Rule("HR & HRV by stage")
                     autonomicGrid(auto)
                 }
 
-                Rule("interpretation")
-                interpretation(n, metrics)
+                Rule("Sleep summary")
+                if n.stagingComplete { interpretation(n, metrics) }
             } else {
                 // model-free build: signals only, no hypnogram
                 if hasAnySeries(n) {
                     Rule("overnight signals")
                     Polysomnograph(night: n)
                 }
-                Text("On-device sleep staging (SleepNet) runs in the torch build — the hypnogram, sleep cycles, and stage metrics appear there. The raw signals above are model-free.")
+                Text("Sleep analysis is not available for this night yet.")
                     .font(Obs.mono(12)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
             }
         } else {
             Text("No sleep recorded for this night.").font(Obs.mono(13)).foregroundStyle(Obs.ink2)
         }
+    }
+
+    @ViewBuilder private func bedtimeEditor(_ n: NightRow) -> some View {
+        let nightKey = n.date ?? day
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 16) {
+                HStack(spacing: 6) {
+                    Text("BEDTIME").font(Obs.mono(9)).tracking(1.1).foregroundStyle(Obs.ink2)
+                    DatePicker("Bedtime", selection: $bedtimeDate, displayedComponents: .hourAndMinute)
+                        .labelsHidden()
+                        .disabled(savingBedtime)
+                }
+                HStack(spacing: 6) {
+                    Text("WAKE-UP").font(Obs.mono(9)).tracking(1.1).foregroundStyle(Obs.ink2)
+                    DatePicker("Wake-up", selection: $wakeupDate, displayedComponents: .hourAndMinute)
+                        .labelsHidden()
+                        .disabled(savingBedtime)
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    let startHM = Self.hmFromDate(bedtimeDate)
+                    let endHM = Self.hmFromDate(wakeupDate)
+                    savingBedtime = true
+                    Task {
+                        try? BedtimeOverrideStore.set(startHM: startHM, endHM: endHM, forNightKey: nightKey, night: n)
+                        _ = await analysis?.refresh(DayAnalysisRequest(day: day, kind: .sleep))
+                        savingBedtime = false
+                        editingBedtime = false
+                    }
+                } label: {
+                    Text(savingBedtime ? "saving…" : "apply")
+                        .font(Obs.mono(11, .medium))
+                        .foregroundStyle(Obs.paper)
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(Obs.ink, in: RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(savingBedtime)
+
+                if n.isBedtimeManual || n.raw_start != nil {
+                    Button {
+                        savingBedtime = true
+                        Task {
+                            try? BedtimeOverrideStore.clear(forNightKey: nightKey, night: n)
+                            _ = await analysis?.refresh(DayAnalysisRequest(day: day, kind: .sleep))
+                            savingBedtime = false
+                            editingBedtime = false
+                        }
+                    } label: {
+                        Text("reset\(n.raw_start.map { " (\($0)–\(n.raw_end ?? ""))" } ?? "")")
+                            .font(Obs.mono(11))
+                            .foregroundStyle(Obs.ink2)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Obs.trace.opacity(0.6), lineWidth: 0.8))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(savingBedtime)
+                }
+
+                Button {
+                    editingBedtime = false
+                } label: {
+                    Text("cancel").font(Obs.mono(11)).foregroundStyle(Obs.muted)
+                }
+                .buttonStyle(.plain)
+                .disabled(savingBedtime)
+            }
+        }
+        .padding(12)
+        .background(Obs.paper.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Obs.trace.opacity(0.45), lineWidth: 0.6))
     }
 
     private var stageLegend: some View {
@@ -842,12 +1572,16 @@ struct SleepReport: View {
     }
 
     private func hasAnySeries(_ n: NightRow) -> Bool {
+        if let st = n.series_t,
+           [st.hr, st.hrv, st.spo2, st.temp, st.motion].contains(where: { $0.count > 1 }) {
+            return true
+        }
         guard let s = n.series else { return false }
         return [s.hr, s.hrv, s.spo2, s.temp, s.motion].contains { $0.count > 1 }
     }
 
     @ViewBuilder private func clinicalGrid(_ m: SleepMetrics) -> some View {
-        let mins = { (x: Double?) in x.map { "\(Int($0.rounded())) min" } ?? "—" }
+        let mins = { (x: Double?) in x.map { "\(Int($0.rounded())) min" } ?? "–" }
         let cells: [(String, String)] = [
             ("sleep onset", mins(m.solMin)),
             ("rem latency", mins(m.remLatencyMin)),
@@ -863,8 +1597,8 @@ struct SleepReport: View {
     }
 
     @ViewBuilder private func autonomicGrid(_ a: StageAutonomic) -> some View {
-        let hrv = { (x: Double?) in x.map { "\(Int($0)) ms" } ?? "—" }
-        let hr = { (x: Double?) in x.map { "\(Int($0)) bpm" } ?? "—" }
+        let hrv = { (x: Double?) in x.map { "\(Int($0)) ms" } ?? "–" }
+        let hr = { (x: Double?) in x.map { "\(Int($0)) bpm" } ?? "–" }
         let cells: [(String, String)] = [
             ("hrv · deep", hrv(a.hrvDeep)), ("hrv · light", hrv(a.hrvLight)), ("hrv · rem", hrv(a.hrvRem)),
             ("hr · deep", hr(a.hrDeep)), ("hr · light", hr(a.hrLight)), ("hr · rem", hr(a.hrRem)),
@@ -875,38 +1609,62 @@ struct SleepReport: View {
         }
     }
 
+    /// One row per finding: an icon in the stage colour, a plain label and a mono value.
+    /// Same vocabulary as the summary strip at the top of the report.
     @ViewBuilder private func interpretation(_ n: NightRow, _ m: SleepMetrics?) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(sentences(n, m), id: \.self) { t in
-                Text(t).font(Obs.prose(14)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(findings(n, m), id: \.label) { f in
+                summaryRow(icon: f.icon, tint: f.tint, label: f.label, value: f.value, detail: f.detail)
             }
             if let d = s.sleepDebt, d.valid {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(debtDuration(d.debt_min)).font(Obs.mono(20, .medium)).foregroundStyle(Obs.debt(d.state))
-                    Text("accumulated sleep debt vs your \(debtDuration(d.need_h * 60)) nightly need" + (d.recent_shortfall_min > 0 ? " · last sleep day \(Int(d.recent_shortfall_min)) min short" : ""))
-                        .font(Obs.mono(11)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.top, 6)
+                summaryRow(icon: "bed.double", tint: Obs.debt(d.state), label: "Sleep debt",
+                           value: debtDuration(d.debt_min),
+                           detail: "vs \(debtDuration(d.need_h * 60)) nightly need"
+                               + (d.recent_shortfall_min > 0 ? " · last day \(Int(d.recent_shortfall_min)) min short" : ""))
             }
         }
     }
 
-    private func sentences(_ n: NightRow, _ m: SleepMetrics?) -> [String] {
-        var out: [String] = []
+    private func summaryRow(icon: String, tint: Color, label: String, value: String, detail: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .medium)).foregroundStyle(tint)
+                .frame(width: 20, alignment: .center)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
+                if let detail {
+                    Text(detail).font(Obs.mono(11)).foregroundStyle(Obs.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Text(value).font(Obs.mono(15, .medium)).foregroundStyle(tint).monospacedDigit()
+        }
+        .padding(.vertical, 9)
+        .overlay(alignment: .bottom) { Rectangle().fill(Obs.trace.opacity(0.5)).frame(height: 0.5) }
+    }
+
+    private struct Finding { let icon: String; let tint: Color; let label: String; let value: String; let detail: String? }
+
+    private func findings(_ n: NightRow, _ m: SleepMetrics?) -> [Finding] {
+        var out: [Finding] = []
         if let e = n.efficiency {
-            out.append(e >= 85 ? "Sleep efficiency of \(Int(e))% is solid — little time awake once down."
-                : e >= 75 ? "Efficiency \(Int(e))% is fair; some fragmentation kept you from deeper rest."
-                : "Efficiency \(Int(e))% is low — much of the night in bed wasn't spent asleep.")
+            let tint: Color = e >= 85 ? Obs.good : e < 75 ? Obs.bad : Obs.ink
+            out.append(Finding(icon: "moon.zzz", tint: tint, label: "Asleep while in bed", value: "\(Int(e))%", detail: nil))
         }
         if let dp = n.deep_pct {
-            out.append(dp < 10 ? "Deep sleep was scarce (\(Int(dp))%), the physically-restorative stage — often suppressed by late meals, alcohol, or stress."
-                : "Deep sleep \(Int(dp))% (target ~13–23%), the physically-restorative stage.")
+            out.append(Finding(icon: "waveform.path", tint: Obs.deep, label: "Deep sleep", value: "\(Int(dp))%", detail: nil))
         }
-        if let rp = n.rem_pct, let rl = m?.remLatencyMin {
-            out.append("REM was \(Int(rp))% with first REM \(Int(rl.rounded())) min after onset.")
+        if let rp = n.rem_pct {
+            let detail = m?.remLatencyMin.map { "first REM \(Int($0.rounded())) min after onset" }
+            out.append(Finding(icon: "eye", tint: Obs.rem, label: "REM sleep", value: "\(Int(rp))%", detail: detail))
         }
         if let m {
-            out.append("You spent \(Int(m.wasoMin.rounded())) min awake across \(m.awakenings) awakening\(m.awakenings == 1 ? "" : "s") after first falling asleep.")
+            let n = m.awakenings
+            out.append(Finding(icon: "sun.max", tint: Obs.wake, label: "Awake after falling asleep",
+                               value: "\(Int(m.wasoMin.rounded())) min",
+                               detail: "\(n) awakening\(n == 1 ? "" : "s")"))
         }
         return out
     }
@@ -922,8 +1680,8 @@ struct ActivityReport: View {
 
         HStack(alignment: .top, spacing: 0) {
             Readout(value: steps.value, caption: steps.unit)
-            Readout(value: st.map { "\(Int($0.active_kcal ?? 0))" } ?? "—", caption: "active kcal")
-            Readout(value: st.map { "\(Int($0.total_kcal ?? 0))" } ?? "—", caption: "total kcal")
+            Readout(value: st.map { "\(Int($0.active_kcal ?? 0))" } ?? "–", caption: "active kcal")
+            Readout(value: st.map { "\(Int($0.total_kcal ?? 0))" } ?? "–", caption: "total kcal")
             if let d = st?.distance_m { Readout(value: String(format: "%.1f", d / 1000), caption: "distance · km") }
         }
 
@@ -954,7 +1712,7 @@ struct ActivityReport: View {
 }
 
 private func compactSteps(_ steps: Double?) -> (value: String, unit: String) {
-    guard let steps else { return ("—", "steps") }
+    guard let steps else { return ("–", "steps") }
     guard steps >= 1_000 else { return ("\(Int(steps.rounded()))", "steps") }
     return (String(format: "%.1f", steps / 1_000), "k steps")
 }

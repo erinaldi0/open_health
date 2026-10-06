@@ -19,7 +19,12 @@ const cap = (s) => esc(s).replace(/^./, (c) => c.toUpperCase());
 const kfmt = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(Math.round(n)));
 
 let CURRENT_PROFILE = null;
+let CURRENT_TZ = 0; // hours from UTC, as the summary reports it
 let LAST_DEVICE_SERIAL = null;
+const browserTzOffset = () => {
+  const off = -new Date().getTimezoneOffset() / 60;
+  return Number.isFinite(off) ? off : 0;
+};
 
 // ── local dashboard fetch helpers ──────────────────────────────────────────
 // Every mutating endpoint is gated by the X-Oura-Dash header; these centralize it
@@ -163,7 +168,7 @@ function renderTiles(d) {
       status: diff < -0.5 ? { label: "Younger", kind: "ok" } : diff > 0.5 ? { label: "Older", kind: "warn" } : { label: "In line", kind: "neutral" },
     }));
   } else {
-    box.append(metricCard("Vascular age", "—", "", { sub: "needs cva_ppg on" }));
+    box.append(metricCard("Vascular age", "—", "", { sub: cvaMissing(d).short }));
   }
 }
 
@@ -184,6 +189,7 @@ function hypnogram(stages) {
 // as one coherent day. Kept identical to the iOS Summary.wakeYmd.
 function wakeYmd(n) {
   if (!n || !n.ymd) return null;
+  if (n.wake_ymd) return n.wake_ymd;
   if (n.start && n.end && n.end < n.start) {
     const [y, m, dd] = n.ymd.split("-").map(Number);
     const t = new Date(y, m - 1, dd + 1);
@@ -286,15 +292,69 @@ function dayCard(d, ymd) {
   }
   ap.addEventListener("click", () => openDayPage(d, ymd, "activity"));
   card.append(ap);
+
+  // heart rate: the tab's 15-minute bars as a strip on the same 24 h as the ridge above
+  const hp = el("button", "day-part");
+  hp.type = "button";
+  hp.append(el("div", "dp-head",
+    `<span class="dp-tag">Heart rate</span><span class="dp-meta">loading…</span><span class="dp-chev"></span>`));
+  const strip = el("div", "day-hr");
+  hp.append(strip);
+  hp.addEventListener("click", () => openDayPage(d, ymd, "heart"));
+  card.append(hp);
+  fillDayHr(ymd, hp.querySelector(".dp-meta"), strip);
   return card;
+}
+
+// The summary doesn't carry per-slot heart rate, so the "Your day" strip fetches it
+// on its own and fills in when it arrives.
+let HR_QUARTER_LOAD = null;
+function fillDayHr(ymd, meta, strip) {
+  const request = HR_QUARTER_LOAD ||= fetch(`/api/hourly-hr?minutes=15&tz=${browserTzOffset()}`).then((r) => r.json());
+  request
+    .then((j) => {
+      if (j.error) throw new Error(j.error);
+      const { bySlot, rows } = hrDaySlots(j, ymd);
+      if (!rows.length) { meta.textContent = "no readings yet"; return; }
+      const r0 = Math.round;
+      const low = Math.min(...rows.map((r) => r.low)), high = Math.max(...rows.map((r) => r.high));
+      const latest = hrLatestOn(j, ymd);
+      meta.textContent = (latest != null ? `latest ${r0(latest)} bpm · ` : "") + `${r0(low)}–${r0(high)} bpm`;
+      strip.innerHTML =
+        `<div class="day-hr-plot">${hrBinsSvg(bySlot, Math.max(0, low - 5), high + 5, 1000, 44, false)}</div>` +
+        `<div class="met-axis">${[0, 6, 12, 18, 24].map((h) => `<span style="left:${(h / 24 * 100).toFixed(1)}%">${String(h).padStart(2, "0")}</span>`).join("")}</div>`;
+    })
+    .catch(() => { meta.textContent = "couldn't load"; });
 }
 
 function renderDay(d) {
   const box = $("day");
   box.innerHTML = "";
   const days = dayKeys(d);
+  // Nights the shared brain withheld because the ring clock could not be resolved
+  // unambiguously (missing anchor, accelerated counter, or multi-reboot stall).
+  const clockWarnings = d.clock?.warnings || [];
+  const unanchored = (d.clock?.epochs || []).some((e) => !e.anchors);
+  const canSyncFix = unanchored || (d.clock?.undated_nights || []).some((n) => n.recoverable);
+  const clockNote = () => {
+    if (!clockWarnings.length && !unanchored) return null;
+    const note = el("div", "clock-note");
+    note.append(el("div", "clock-note-title", "Ring clock"));
+    for (const w of clockWarnings) note.append(el("p", null, esc(w)));
+    if (unanchored && !clockWarnings.length) {
+      note.append(el("p", null, "Part of the ring's history has no time anchor, so it cannot be placed on the calendar yet."));
+      note.append(el("p", "clock-note-fix", "Run <code>oura sync</code> while the ring is still on its current boot to anchor it."));
+    }
+    return note;
+  };
   if (!days.length) {
-    box.append(el("div", "error", "No days yet. Wear the ring and sync."));
+    box.append(el("div", "error", canSyncFix
+      ? "No dated days yet: the ring's clock hasn't been anchored for this data."
+      : clockWarnings.length
+        ? "No dated days yet: recorded nights could not be dated unambiguously."
+        : "No days yet. Wear the ring and sync."));
+    const note = clockNote();
+    if (note) box.append(note);
     $("sleep-legend").hidden = true;
     return;
   }
@@ -307,6 +367,8 @@ function renderDay(d) {
     btn.addEventListener("click", () => openDaysBrowser(d, days));
     box.append(btn);
   }
+  const note = clockNote();
+  if (note) box.append(note);
 }
 
 const debtDuration = (minutes) => {
@@ -386,26 +448,46 @@ const BIOMARKER_UNIT = {
   AverageBreath: " br/min", LowestHeartRate: " bpm", AverageHrv: " ms", TemperatureDeviation: "°C",
 };
 
+const cvaMissing = (d) => {
+  const gated = (d.device?.insights || []).find((i) => i.name === "Cardiovascular age")?.status === "gated";
+  return gated
+    ? { short: "needs cva_ppg on", long: "Cardiovascular age needs the cva_ppg feature on. Enable it, then sync overnight." }
+    : { short: "needs the CVA model", long: "Cardiovascular age needs the CVA model runner (Python + tools/run_cva_model.py); the ring's PPG data is already there." };
+};
+
 function renderIllness(d) {
   const box = $("illness");
   box.innerHTML = "";
-  const ill = d.illness;
-  if (!ill) { box.append(el("div", "error", "Symptom radar needs the model runner (desktop dashboard).")); return; }
+  // Oura's model when the Python runner produced it, otherwise the shared core's
+  // model-free radar (same choice as the iOS app's `symptomRadar`).
+  const fromModel = !!d.illness?.available;
+  const ill = fromModel ? d.illness : (d.symptoms || d.illness);
+  if (!ill) { box.append(el("div", "error", "Symptom radar needs a few nights of sleep data.")); return; }
+  // The runner emits snake_case, the core camelCase.
+  const trafficLight = ill.traffic_light ?? ill.trafficLight;
+  const daysWithData = ill.days_with_data ?? ill.daysWithData;
   if (!ill.available) {
     const why = ill.status === "MISSING_LAST_NIGHT_SLEEP" ? "Last night's sleep is missing — wear the ring overnight and sync."
-      : ill.status === "MISSING_SLEEP_DATA" ? "Too many recent nights are missing (needs ≥ 7 of the last 14)."
+      : ill.status === "MISSING_SLEEP_DATA" ? (fromModel || d.illness
+        ? "Too many recent nights are missing (needs ≥ 7 of the last 14)."
+        : "Needs at least 7 nights of sleep to learn your baseline.")
       : "Not enough history yet.";
     box.append(el("div", "error", why));
     return;
   }
-  const light = ILLNESS_LIGHT[ill.traffic_light] || "ok";
+  const light = ILLNESS_LIGHT[trafficLight] || "ok";
   const head = el("div", `il-status il-${light}`);
-  const label = ill.traffic_light === "NO_SIGNS" ? "No signs" : ill.traffic_light === "MINOR_SIGNS" ? "Minor signs" : "Major signs";
+  const label = { NO_SIGNS: "No signs", MINOR_SIGNS: "Minor signs", MAJOR_SIGNS: "Major signs" }[trafficLight] || "No result yet";
   head.innerHTML = `<span class="il-dot"></span><span class="il-label">${label}</span>`;
   box.append(head);
-  box.append(el("p", "il-copy", ILLNESS_COPY[ill.status] || ""));
-
   const flagged = (ill.biomarkers || []).filter((b) => b.indicatesSymptoms);
+  // The decision is the model's overall score, not a count of flags: a night can have
+  // biometrics out of range and still not add up to strain.
+  const copy = ill.status === "NO_SIGNS" && flagged.length
+    ? `No signs of illness. ${flagged.length === 1 ? "One biometric is" : `${flagged.length} biometrics are`} outside your usual range, but together they don't match the pattern of your body fighting something.`
+    : ILLNESS_COPY[ill.status] || "";
+  box.append(el("p", "il-copy", copy));
+
   if (flagged.length) {
     const list = el("div", "il-biomarkers");
     for (const b of flagged) {
@@ -417,7 +499,8 @@ function renderIllness(d) {
     }
     box.append(list);
   }
-  box.append(el("div", "il-foot", `On-device illness model · ${ill.days_with_data} of 30 days · ${esc(ill.date)}`));
+  const basis = fromModel ? `On-device illness model · ${daysWithData} of 30 days` : `Compared with your own baseline · ${daysWithData} nights`;
+  box.append(el("div", "il-foot", `${basis} · ${esc(ill.date)}`));
 }
 
 function renderCardio(d) {
@@ -428,7 +511,7 @@ function renderCardio(d) {
   // VO₂max is model-free (from demographics), so it shows even without the CVA model.
   const vo2Kv = vo2 != null ? el("div", "kv", `<div class="k">VO₂max estimate</div><div class="v">${vo2} ml/kg/min</div>`) : null;
   if (!cv || cv.vascular_age == null) {
-    box.append(el("div", "error", "Cardiovascular age needs the cva_ppg feature on. Enable it, then sync overnight."));
+    box.append(el("div", "error", cvaMissing(d).long));
     if (vo2Kv) { const kvs = el("div", "kvs"); kvs.append(vo2Kv); box.append(kvs); }
     return;
   }
@@ -560,29 +643,202 @@ function closePage() {
   p.hidden = true;
   p.replaceChildren();
   document.body.classList.remove("page-open");
+  DAY_NAV = null;
 }
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("page").hidden) closePage(); });
+let DAY_NAV = null; // the open day page's ← / → targets
+document.addEventListener("keydown", (e) => {
+  if ($("page").hidden) return;
+  if (e.key === "Escape") closePage();
+  else if (DAY_NAV && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+    const go = e.key === "ArrowLeft" ? DAY_NAV.older : e.key === "ArrowRight" ? DAY_NAV.newer : null;
+    if (go) { e.preventDefault(); go(); }
+  }
+});
 
-// page shell: back button + date + Sleep/Activity tab switch
-function openDayPage(d, ymd, tab = "sleep") {
+// ── day page: one scrolling page — Sleep, Activity, Heart rate — on one time axis ─
+// Every chart plots against the same axis (dayAxis) and shares one cursor (dayCursor),
+// so a vertical line marks the same moment in all of them. `focus` ("sleep" |
+// "activity" | "heart") scrolls to that section on open.
+function openDayPage(d, ymd, focus = null, keepScroll = false) {
   const wrap = el("div", "rpt");
   const head = el("div", "rpt-head");
   const back = el("button", "rpt-back", "‹ Back");
   back.type = "button";
   back.addEventListener("click", closePage);
-  const tabs = el("div", "rpt-tabs");
-  const mk = (key, label) => {
-    const b = el("button", "rpt-tab" + (tab === key ? " on" : ""), label);
+  const axis = dayAxis(d, ymd);
+  const exp = el("button", "rpt-back rpt-export", "Export JSON");
+  exp.type = "button";
+  exp.title = "Download this day's sleep, activity and heart-rate data as JSON";
+  exp.addEventListener("click", () => exportDayJson(d, ymd, axis));
+  // ‹ › step through the days that have data (dayKeys, newest first) at the same
+  // scroll position — so one chart can be compared across days
+  const days = dayKeys(d);
+  const older = days.find((k) => k < ymd) || null;
+  const newer = days.slice().reverse().find((k) => k > ymd) || null;
+  const go = (k) => openDayPage(d, k, null, true);
+  const step = (k, label, name, key) => {
+    const b = el("button", "rpt-day", label);
     b.type = "button";
-    b.addEventListener("click", () => openDayPage(d, ymd, key));
+    b.title = k ? `${name} day: ${dayTitle(k)} (${key})` : `No ${name === "Previous" ? "earlier" : "later"} day`;
+    b.setAttribute("aria-label", b.title);
+    if (k) b.addEventListener("click", () => go(k));
+    else b.disabled = true;
     return b;
   };
-  tabs.append(mk("sleep", "Sleep"), mk("activity", "Activity"));
-  head.append(back, el("div", "rpt-title", dayTitle(ymd)), tabs);
+  const when = el("div", "rpt-when");
+  when.append(step(older, "‹", "Previous", "←"), el("div", "rpt-title", dayTitle(ymd)), step(newer, "›", "Next", "→"));
+  head.append(back, when, exp);
+  const cursor = dayCursor(axis);
   const body = el("div", "rpt-body");
-  body.append(tab === "activity" ? activityReport(d, ymd) : sleepReport(d, ymd));
+  body.append(sleepSection(d, ymd, axis, cursor), activitySection(d, ymd, axis, cursor), heartSection(ymd, axis, cursor));
   wrap.append(head, body);
+  const top = $("page").scrollTop;
   showPage(wrap);
+  if (keepScroll) $("page").scrollTop = top;
+  else if (focus) wrap.querySelector(`#sec-${focus}`)?.scrollIntoView({ block: "start" });
+  DAY_NAV = { older: older && (() => go(older)), newer: newer && (() => go(newer)) };
+}
+
+// The day page's shared time axis, in unix seconds: from the start of this day's night
+// (floored to the hour) when it began the evening before, else local midnight, to the
+// midnight that ends the day. `frac` maps a time onto it and `at` maps back.
+function dayAxis(d, ymd) {
+  const tz = d.tz || 0;
+  const [y, mo, dd] = ymd.split("-").map(Number);
+  const dayStart = Date.UTC(y, mo - 1, dd) / 1000 - tz * 3600;
+  const n = nightForDay(d, ymd);
+  const t0 = n && n.start_unix != null && n.start_unix < dayStart ? Math.floor(n.start_unix / 3600) * 3600 : dayStart;
+  const t1 = dayStart + 86400;
+  const pad = (v) => String(v).padStart(2, "0");
+  return {
+    t0, t1, dayStart,
+    frac: (t) => (t - t0) / (t1 - t0),
+    at: (f) => t0 + f * (t1 - t0),
+    clock: (t) => {
+      const s = (((Math.floor(t) + tz * 3600) % 86400) + 86400) % 86400;
+      return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}`;
+    },
+    // 6-hourly ticks on the local clock, plus the axis start when it isn't one
+    ticks() {
+      const out = [];
+      for (let t = Math.ceil(t0 / 3600) * 3600; t <= t1; t += 3600) {
+        const h = ((((t + tz * 3600) / 3600) % 24) + 24) % 24;
+        if (h % 6 === 0 || t === t0) out.push({ f: (t - t0) / (t1 - t0), label: t === t1 ? "24" : pad(h) });
+      }
+      return out;
+    },
+  };
+}
+
+// One cursor for the whole day page: hovering any timeline box draws the line at the
+// same moment through every box, shows the clock in each box's pill, and swaps each
+// row's summary for its value at that time. Boxes register as they render (heart rate
+// arrives later and re-renders on the 15 min / 1 h switch); `onMove` hooks extra
+// readouts, one per key.
+function dayCursor(axis) {
+  let boxes = [];
+  const hooks = new Map();
+  const show = (f) => {
+    boxes = boxes.filter((b) => b.el.isConnected);
+    const t = axis.at(f);
+    for (const b of boxes) {
+      b.line.hidden = b.pill.hidden = false;
+      b.line.style.setProperty("--f", f);
+      b.pill.style.setProperty("--f", f);
+      b.pill.textContent = axis.clock(t);
+      for (const r of b.rows) r.val.textContent = r.valueAt(t);
+    }
+    hooks.forEach((fn) => fn(t));
+  };
+  const hide = () => {
+    for (const b of boxes) {
+      b.line.hidden = b.pill.hidden = true;
+      for (const r of b.rows) r.val.textContent = r.summary;
+    }
+    hooks.forEach((fn) => fn(null));
+  };
+  return {
+    add(b) {
+      boxes.push(b);
+      const move = (e) => {
+        const r = b.el.querySelector(".tl-plot").getBoundingClientRect();
+        show(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)));
+      };
+      b.plots.addEventListener("pointermove", move);
+      b.plots.addEventListener("pointerdown", move);
+      b.plots.addEventListener("pointerleave", hide);
+    },
+    onMove(key, fn) { hooks.set(key, fn); },
+  };
+}
+
+// A timeline box: labelled rows over the shared axis, faint 6-hour lines, an hour axis,
+// and this box's share of the page cursor. Each row: { label, summary, html, height,
+// valueAt(t), rticks } — `rticks` is HTML for the right-hand scale column.
+function tlBox(axis, cursor, rows) {
+  const box = el("div", "tl");
+  const plots = el("div", "tl-plots");
+  const ticks = axis.ticks();
+  plots.insertAdjacentHTML("beforeend", ticks.map((k) => `<i class="tl-vline" style="--f:${k.f.toFixed(4)}"></i>`).join(""));
+  const live = [];
+  for (const R of rows) {
+    const row = el("div", "tl-row");
+    if (R.height) row.style.height = R.height + "px";
+    const gut = el("div", "tl-gut");
+    const val = el("div", "tl-val");
+    val.textContent = R.summary || "";
+    gut.append(el("div", "tl-label", esc(R.label)), val);
+    const plot = el("div", "tl-plot", R.html);
+    row.append(gut, plot, el("div", "tl-rgut", R.rticks || ""));
+    plots.append(row);
+    live.push({ val, summary: R.summary || "", valueAt: R.valueAt });
+  }
+  const line = el("div", "tl-cursor");
+  const pill = el("div", "tl-pill");
+  line.hidden = pill.hidden = true;
+  plots.append(line, pill);
+  const axisRow = el("div", "tl-axis", ticks.map((k) => `<span style="--f:${k.f.toFixed(4)}">${k.label}</span>`).join(""));
+  box.append(plots, axisRow);
+  cursor.add({ el: box, plots, line, pill, rows: live });
+  return box;
+}
+
+const secHead = (title, extra) => {
+  const h = el("div", "rpt-sec-head");
+  h.append(el("h2", "", title));
+  if (extra) h.append(extra);
+  return h;
+};
+const statTile = (k, v) => `<div class="ss"><div class="ss-v">${v}</div><div class="ss-k">${k}</div></div>`;
+
+// The whole day as a JSON download: header + the sleep, activity and heart-rate
+// sections (iOS `DayExport` exports one tab's section in the same shapes).
+function exportDayJson(d, ymd, axis) {
+  const n = nightForDay(d, ymd);
+  const debt = ((d.sleep_debt || {}).days || []).find((x) => x.date === ymd) || null;
+  const hr = HOURLY_HR || {};
+  const tzOff = d.tz ?? browserTzOffset();
+  const tzName = (typeof Intl !== "undefined" && Intl.DateTimeFormat && Intl.DateTimeFormat().resolvedOptions().timeZone)
+    || `UTC${tzOff >= 0 ? "+" : ""}${tzOff}`;
+  const payload = {
+    day: ymd, kind: "day", generated_at: new Date().toISOString(),
+    timezone: tzName,
+    tz_offset: tzOff,
+    app_version: "web", profile: d.profile || null,
+    sleep: n ? { night: n, sleep_debt: debt } : null,
+    activity: {
+      daily: (d.activity_daily || {})[ymd] || null,
+      profile_met: (d.activity_profile || {})[ymd] || [],
+      workouts: (Array.isArray(d.activity) ? d.activity : []).filter((w) => String(w.start || "").startsWith(ymd)),
+    },
+    heart_rate: { minutes: hr.minutes || 60, bins: (hr.bins || []).filter((b) => b.unix >= axis.t0 && b.unix < axis.t1) },
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `oura-${ymd}.json`;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 const stageLegend = () => el("div", "legend rpt-legend",
@@ -590,19 +846,20 @@ const stageLegend = () => el("div", "legend rpt-legend",
   `<span><i class="sw rem"></i>REM</span><span><i class="sw wake"></i>Awake</span>`);
 
 // stepped clinical hypnogram: y = stage level (Awake top → Deep bottom), colored runs
-function hypnoSvg(stages, w, h) {
+function hypnoSvg(stages, w, h, span = [0, 1]) {
   const n = stages.length;
   const padT = 8, plotH = h - 16;
   const yOf = (lvl) => padT + (lvl / 3) * plotH;
-  const xOf = (i) => (i / (n - 1)) * w;
+  const xOf = (i) => (span[0] + (i / Math.max(1, n)) * (span[1] - span[0])) * w;
   let grid = "";
-  for (let l = 0; l < 4; l++) grid += `<line x1="0" y1="${yOf(l).toFixed(1)}" x2="${w}" y2="${yOf(l).toFixed(1)}" stroke="var(--line-soft)" stroke-width="0.5"/>`;
+  for (let l = 0; l < 4; l++) grid += `<line x1="${xOf(0).toFixed(1)}" y1="${yOf(l).toFixed(1)}" x2="${xOf(n).toFixed(1)}" y2="${yOf(l).toFixed(1)}" stroke="var(--line-soft)" stroke-width="0.5"/>`;
   let runs = "", conn = "", prevLvl = null, i = 0;
   while (i < n) {
     const code = stages[i]; let j = i;
     while (j < n && stages[j] === code) j++;
-    const st = STAGE[code] || STAGE[2];
-    const x1 = xOf(i), x2 = xOf(Math.min(j, n - 1)), y = yOf(st.lvl);
+    if (!STAGE[code]) { prevLvl = null; i = j; continue; }
+    const st = STAGE[code];
+    const x1 = xOf(i), x2 = xOf(j), y = yOf(st.lvl);
     runs += `<line x1="${x1.toFixed(1)}" y1="${y.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--${st.cls})" stroke-width="2.5" vector-effect="non-scaling-stroke"/>`;
     if (prevLvl !== null) conn += `<line x1="${x1.toFixed(1)}" y1="${yOf(prevLvl).toFixed(1)}" x2="${x1.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--faint)" stroke-width="0.8" opacity="0.5" vector-effect="non-scaling-stroke"/>`;
     prevLvl = st.lvl; i = j;
@@ -611,7 +868,16 @@ function hypnoSvg(stages, w, h) {
 }
 
 // smooth auto-scaled line + faint area + dashed mean, for one signal lane
-function laneSvg(v, w, h, color, span = [0, 1]) {
+function laneSvg(v, w, h, color, span = [0, 1], times = null) {
+  if (times && times.length === v.length && v.length) {
+    const min = Math.min(0, ...v), max = Math.max(min + 1, ...v);
+    const mean = v.reduce((a, b) => a + b, 0) / v.length;
+    const bars = v.map((value, i) => {
+      const x = times[i] * w, y = 5 + (1 - (value - min) / (max - min)) * (h - 10);
+      return `<line x1="${x}" x2="${x}" y1="${h - 5}" y2="${y}" stroke="${color}" stroke-width="1.5"/>`;
+    }).join("");
+    return { mean, min, max, svg: `<svg class="lane-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${bars}</svg>` };
+  }
   if (v.length < 2) return null;
   const min = Math.min(...v), max = Math.max(...v), rng = (max - min) || 1;
   const mean = v.reduce((a, b) => a + b, 0) / v.length;
@@ -628,51 +894,42 @@ function laneSvg(v, w, h, color, span = [0, 1]) {
   };
 }
 
-// compose the hypnogram + signal lanes into one stack with a shared hover crosshair;
-// the crosshair updates each lane's gutter value + a floating clock readout.
-function polysomnograph(n, lanes) {
-  const win = nightWin(n);
-  const box = el("div", "psg");
-  const plots = el("div", "psg-plots");
-  const cursor = el("div", "psg-cursor"); cursor.hidden = true;
-  const readout = el("div", "psg-readout"); readout.hidden = true;
-  const live = [];
-  lanes.forEach((L) => {
-    const lane = el("div", "psg-lane" + (L.tall ? " tall" : ""));
-    const gut = el("div", "psg-gut");
-    gut.append(el("div", "psg-label", L.label));
-    const val = el("div", "psg-val"); val.textContent = L.summary || "";
-    gut.append(val);
-    const plot = el("div", "psg-plot"); plot.innerHTML = L.svg;
-    lane.append(gut, plot);
-    plots.append(lane);
-    live.push({ ...L, val });
+// A signal lane from time-true [unix, value] points (nights[].series_t) on the day axis.
+// The line breaks wherever the ring recorded nothing for more than LANE_GAP_S, instead
+// of being stretched over the gap.
+const LANE_GAP_S = 15 * 60;
+function timedLaneSvg(pts, axis, w, h, color) {
+  if (pts.length < 2) return null;
+  const vals = pts.map((p) => p[1]);
+  const min = Math.min(...vals), max = Math.max(...vals), rng = (max - min) || 1;
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const pad = 5, x = (t) => axis.frac(t) * w, y = (v) => pad + (1 - (v - min) / rng) * (h - 2 * pad);
+  const segs = [[]];
+  pts.forEach((p, i) => {
+    if (i && p[0] - pts[i - 1][0] > LANE_GAP_S) segs.push([]);
+    segs[segs.length - 1].push([x(p[0]), y(p[1])]);
   });
-  plots.append(cursor);
-  // hour ticks along the bottom
-  const axis = el("div", "psg-lane psg-axis");
-  const ticksHtml = [];
-  for (let t = Math.ceil(win.a / 60) * 60; t <= win.b; t += 60)
-    ticksHtml.push(`<span style="left:${((t - win.a) / win.span * 100).toFixed(2)}%">${String(Math.floor((t % 1440) / 60)).padStart(2, "0")}</span>`);
-  axis.innerHTML = `<div class="psg-gut"></div><div class="psg-plot psg-ticks">${ticksHtml.join("")}</div>`;
-  box.append(readout, plots, axis);
-
-  plots.addEventListener("mousemove", (e) => {
-    const anyPlot = plots.querySelector(".psg-plot");
-    const r = anyPlot.getBoundingClientRect();
-    const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    const gutW = plots.querySelector(".psg-gut").getBoundingClientRect().width;
-    cursor.hidden = false; readout.hidden = false;
-    cursor.style.left = `${gutW + f * r.width}px`;
-    readout.style.left = `${gutW + f * r.width}px`;
-    readout.textContent = clockAt(win, f);
-    live.forEach((L) => { L.val.textContent = L.valueAt(f); });
-  });
-  plots.addEventListener("mouseleave", () => {
-    cursor.hidden = true; readout.hidden = true;
-    live.forEach((L) => { L.val.textContent = L.summary || ""; });
-  });
-  return box;
+  let area = "", line = "";
+  for (const s of segs) {
+    if (s.length === 1) s.push([s[0][0] + 1.5, s[0][1]]); // a lone point still shows
+    const d = smoothPath(s);
+    line += d + " ";
+    area += `${d} L${s[s.length - 1][0].toFixed(1)} ${h} L${s[0][0].toFixed(1)} ${h} Z `;
+  }
+  const my = y(mean).toFixed(1);
+  return {
+    mean,
+    svg: `<svg class="lane-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">` +
+      `<path d="${area}" fill="${color}" opacity="0.09"/>` +
+      `<line x1="${x(pts[0][0]).toFixed(1)}" y1="${my}" x2="${x(pts[pts.length - 1][0]).toFixed(1)}" y2="${my}" stroke="${color}" stroke-width="0.6" stroke-dasharray="3 3" opacity="0.45"/>` +
+      `<path d="${line}" fill="none" stroke="${color}" stroke-width="1.4" vector-effect="non-scaling-stroke"/></svg>`,
+  };
+}
+// the point nearest `t` within `tol` seconds, else null
+function nearestPoint(pts, t, tol) {
+  let best = null;
+  for (const p of pts) if (Math.abs(p[0] - t) <= tol && (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t))) best = p;
+  return best;
 }
 
 // horizontal stage-proportion bar (Deep/Light/REM/Awake)
@@ -685,6 +942,7 @@ function stageBar(n) {
 
 // science-based read of the night → a few plain-language sentences + a sleep-debt note
 function sleepInterpretation(d, n, m) {
+  if (n.staging_complete === false) return el("p", "error", "Sleep analysis is incomplete; gaps cannot establish awake time or sleep onset.");
   const wrap = el("div", "interp");
   const out = [];
   if (n.efficiency != null)
@@ -710,40 +968,163 @@ function sleepInterpretation(d, n, m) {
   return wrap;
 }
 
-function sleepReport(d, ymd) {
+// Sleep: stats, then the overnight lanes on the night's slice of the day axis — shown
+// with or without a hypnogram (stages need Oura's SleepNet model; the signals don't) —
+// then the stage-derived architecture and interpretation when stages exist.
+function sleepSection(d, ymd, axis, cursor) {
+  const sec = el("section", "rpt-sec");
+  sec.id = "sec-sleep";
   const n = nightForDay(d, ymd);
-  const root = el("div", "rpt-sleep");
-  if (!n || !(n.stages_full && n.stages_full.length)) {
-    root.append(el("div", "error", "No sleep hypnogram for this night yet — run a sync so the SleepNet model can score it."));
-    return root;
+  const canEditBedtime = !!(n && n.start_ds != null && n.end_ds != null);
+  const editToggle = canEditBedtime ? el("button", "bedtime-edit-btn", n.bedtime_manual ? "Bedtime · edited" : "Adjust bedtime") : null;
+  if (editToggle) {
+    editToggle.type = "button";
+    editToggle.title = "Adjust bedtime and wake-up window for this night";
+  }
+  sec.append(secHead("Sleep", editToggle));
+  if (!n) {
+    sec.append(el("div", "ad-muted", "No sleep ended on this day in the ring's data."));
+    return sec;
   }
   const m = n.metrics || {}, s = n.series || {};
+  const staged = !!(n.stages_full && n.stages_full.length);
   const asleepH = m.asleep_min != null ? m.asleep_min / 60 : null;
-
   const strip = el("div", "stat-strip");
-  const ss = (k, v) => `<div class="ss"><div class="ss-v">${v}</div><div class="ss-k">${k}</div></div>`;
   strip.innerHTML =
-    ss("Time in bed", num(n.in_bed_h) + " h") +
-    ss("Asleep", asleepH != null ? asleepH.toFixed(1) + " h" : "—") +
-    ss("Efficiency", n.efficiency != null ? n.efficiency + "%" : "—") +
-    ss("Bedtime", `${n.start}–${n.end}`);
-  root.append(strip, stageLegend());
+    statTile("Time in bed", num(n.in_bed_h) + " h") +
+    statTile("Asleep", asleepH != null ? asleepH.toFixed(1) + " h" : "—") +
+    statTile("Efficiency", n.efficiency != null ? n.efficiency + "%" : "—") +
+    statTile(n.bedtime_manual ? "Bedtime · edited" : "Bedtime", `${n.start}–${n.end}`);
+  sec.append(strip);
+  if (canEditBedtime) {
+    const editor = el("form", "bedtime-editor");
+    editor.hidden = true;
+    const rawRange = n.raw_start && n.raw_end ? `${n.raw_start}–${n.raw_end}` : null;
+    editor.innerHTML =
+      `<label class="be-field"><span>Bedtime</span><input type="time" name="start" value="${esc(n.start || "23:00")}" required></label>` +
+      `<span class="be-sep">→</span>` +
+      `<label class="be-field"><span>Wake-up</span><input type="time" name="end" value="${esc(n.end || "07:00")}" required></label>` +
+      `<div class="be-actions">` +
+      `<button type="submit" class="be-save">Apply</button>` +
+      (n.bedtime_manual ? `<button type="button" class="be-reset" title="Restore ring-detected window${rawRange ? ` (${rawRange})` : ""}">Reset</button>` : "") +
+      `<button type="button" class="be-cancel">Cancel</button>` +
+      `</div>`;
+    const toggleEditor = () => {
+      editor.hidden = !editor.hidden;
+      editToggle.classList.toggle("active", !editor.hidden);
+    };
+    editToggle.addEventListener("click", toggleEditor);
+    const bedTile = strip.lastElementChild;
+    if (bedTile) {
+      bedTile.classList.add("ss-interactive");
+      bedTile.title = "Click to adjust bedtime and wake-up";
+      bedTile.addEventListener("click", toggleEditor);
+    }
+    editor.querySelector(".be-cancel")?.addEventListener("click", () => {
+      editor.hidden = true;
+      editToggle.classList.remove("active");
+    });
+    const submitOverride = async (payload, okMsg) => {
+      try {
+        const res = await (await postDash("/api/bedtime", payload)).json();
+        if (!res.ok) {
+          toast(res.error || "Could not update bedtime.", "error");
+          return;
+        }
+        toast(okMsg, "ok");
+        const fresh = await (await fetch(`/api/summary?tz=${browserTzOffset()}`)).json();
+        if (!fresh.error) {
+          CURRENT_TZ = fresh.tz || 0;
+          await load();
+          openDayPage(fresh, ymd, null, true);
+        }
+      } catch (_) {
+        toast("Couldn't reach the local server.", "error");
+      }
+    };
+    editor.querySelector(".be-reset")?.addEventListener("click", () => {
+      submitOverride(
+        { raw_start_ds: n.raw_start_ds ?? n.start_ds, captured_unix: n.captured_unix ?? 0, reset: true },
+        "Restored ring-detected sleep window."
+      );
+    });
+    editor.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const fd = new FormData(editor);
+      const startHM = String(fd.get("start") || n.start);
+      const endHM = String(fd.get("end") || n.end);
+      let dStart = parseHM(startHM) - parseHM(n.start);
+      if (dStart > 720) dStart -= 1440;
+      if (dStart < -720) dStart += 1440;
+      let dEnd = parseHM(endHM) - parseHM(n.end);
+      if (dEnd > 720) dEnd -= 1440;
+      if (dEnd < -720) dEnd += 1440;
+      const newStartDs = Math.round(n.start_ds + dStart * 600);
+      let newEndDs = Math.round(n.end_ds + dEnd * 600);
+      if (newEndDs <= newStartDs) newEndDs += 1440 * 600;
+      if (newEndDs - newStartDs < 30 * 600 || newEndDs - newStartDs > 20 * 36000) {
+        toast("Sleep window must be between 30 minutes and 20 hours.", "error");
+        return;
+      }
+      submitOverride(
+        { raw_start_ds: n.raw_start_ds ?? n.start_ds, captured_unix: n.captured_unix ?? 0, start_ds: newStartDs, end_ds: newEndDs },
+        `Updated sleep window (${startHM}–${endHM}).`
+      );
+    });
+    sec.append(editor);
+  }
+  if (staged && n.staging_complete === false)
+    sec.append(el("p", "error", "Incomplete sleep analysis. Gaps mean no data, not awake time; sleep metrics are withheld."));
+  if (staged) sec.append(stageLegend());
+  else sec.append(el("p", "hr-note", "Sleep stages are unavailable for this night. The lanes below are what the ring recorded overnight."));
 
-  // polysomnograph lanes (hypnogram + whatever signals are present)
-  const W = 1000, LH = 50, HH = 92;
-  const stages = n.stages_full;
-  const lanes = [{
-    label: "Hypnogram", summary: "", tall: true, svg: hypnoSvg(stages, W, HH),
-    valueAt: (f) => (STAGE[stages[Math.round(f * (stages.length - 1))]] || {}).name || "",
-  }];
+  const W = 1000, a = axis.frac(n.start_unix), b = axis.frac(n.end_unix);
+  const rows = [];
+  if (staged) {
+    const st = n.stages_full;
+    rows.push({
+      label: "Stages", summary: "", height: 96, html: hypnoSvg(st, W, 92, [a, b]),
+      valueAt: (t) => {
+        const f = axis.frac(t);
+        return f < a || f > b ? "—" : (STAGE[st[Math.round(((f - a) / Math.max(1e-9, b - a)) * (st.length - 1))]] || {}).name || "";
+      },
+    });
+  }
+  const timed = n.series_t; // real times; the flat `series` is only spread evenly
   const addLane = (key, label, unit, color, dp = 0, span = [0, 1]) => {
+    if (timed) {
+      const pts = timed[key] || [];
+      const L = key === "motion"
+        ? laneSvg(pts.map(p => p[1]), W, 50, color, [0, 1], pts.map(p => axis.frac(p[0])))
+        : timedLaneSvg(pts, axis, W, 50, color);
+      if (!L) return;
+      const fmt = (x) => (dp ? x.toFixed(dp) : Math.round(x));
+      rows.push({
+        label, summary: `${fmt(L.mean)} ${unit}`, html: L.svg,
+        valueAt: (t) => { const p = nearestPoint(pts, t, key === "motion" ? 30 : LANE_GAP_S / 2); return p ? `${fmt(p[1])} ${unit}` : "—"; },
+      });
+      return;
+    }
+    if (key === "motion") {
+      if (Array.isArray(s.motion_time) && s.motion_time.length === (s.motion || []).length) {
+        const L = laneSvg(s.motion, W, 50, color, [0, 1], s.motion_time.map(f => a + f * (b - a)));
+        if (L) rows.push({label, summary: `${Math.round(L.mean)} ${unit}`, html: L.svg,
+          valueAt: t => { const pts = s.motion_time.map((f,i) => [n.start_unix + f * (n.end_unix-n.start_unix), s.motion[i]]);
+            const p = nearestPoint(pts,t,30); return p ? `${Math.round(p[1])} ${unit}` : "—"; }});
+      }
+      return;
+    }
     const v = (s[key] || []).filter((x) => x != null);
-    const L = laneSvg(v, W, LH, color, span);
+    const sa = a + span[0] * (b - a), sb = a + span[1] * (b - a);
+    const L = laneSvg(v, W, 50, color, [sa, sb]);
     if (!L) return;
     const fmt = (x) => (dp ? x.toFixed(dp) : Math.round(x));
-    lanes.push({
-      label, svg: L.svg, summary: `${fmt(L.mean)} ${unit}`,
-      valueAt: (f) => f < span[0] || f > span[1] ? "—" : `${fmt(v[Math.round(((f - span[0]) / Math.max(1e-9, span[1] - span[0])) * (v.length - 1))])} ${unit}`,
+    rows.push({
+      label, summary: `${fmt(L.mean)} ${unit}`, html: L.svg,
+      valueAt: (t) => {
+        const f = axis.frac(t);
+        return f < sa || f > sb ? "—" : `${fmt(v[Math.round(((f - sa) / Math.max(1e-9, sb - sa)) * (v.length - 1))])} ${unit}`;
+      },
     });
   };
   addLane("hr", "Heart rate", "bpm", "var(--warn)");
@@ -751,10 +1132,11 @@ function sleepReport(d, ymd) {
   addLane("spo2", "Blood O₂", "%", "var(--rem)");
   addLane("temp", "Skin temp", "°C", "var(--light)", 1, s.temp_span || [0, 1]);
   addLane("motion", "Motion", "s", "var(--faint)");
-  root.append(el("p", "subhead", "Overnight polysomnograph"), polysomnograph(n, lanes));
+  if (rows.length) sec.append(el("p", "subhead", "Overnight"), tlBox(axis, cursor, rows));
+  if (!staged) return sec;
 
   // architecture + clinical metrics
-  root.append(el("p", "subhead", "Sleep architecture"), stageBar(n));
+  sec.append(el("p", "subhead", "Sleep architecture"), stageBar(n));
   const mg = el("div", "metric-grid");
   const mins = (x) => (x != null ? Math.round(x) + " min" : "—");
   const mc = (k, v) => `<div class="mc"><div class="mc-v">${v}</div><div class="mc-k">${k}</div></div>`;
@@ -765,85 +1147,83 @@ function sleepReport(d, ymd) {
     mc("Awakenings", m.awakenings != null ? m.awakenings : "—") +
     mc("Sleep cycles", m.cycles != null ? m.cycles : "—") +
     mc("Fragmentation", m.frag_index != null ? m.frag_index + " /h" : "—");
-  root.append(mg);
+  sec.append(mg);
 
   // autonomic recovery resolved by sleep stage. Deep-sleep HRV is the recovery-relevant
   // number; we deliberately don't show a single overnight HRV "slope" — nocturnal HRV is
   // stage-driven (deep ↑, REM ↓), so a slope mostly tracks stage order, not recovery.
-  const a = n.autonomic;
-  if (a && [a.hrv_deep, a.hrv_light, a.hrv_rem, a.hr_deep, a.hr_light, a.hr_rem].some((x) => x != null)) {
-    root.append(el("p", "subhead", "Autonomic recovery by stage"));
+  const au = n.autonomic;
+  if (au && [au.hrv_deep, au.hrv_light, au.hrv_rem, au.hr_deep, au.hr_light, au.hr_rem].some((x) => x != null)) {
+    sec.append(el("p", "subhead", "Autonomic recovery by stage"));
     const at = el("div", "metric-grid");
-    const cell = (k, v) => `<div class="mc"><div class="mc-v">${v}</div><div class="mc-k">${k}</div></div>`;
     const val = (x, u) => (x != null ? x + u : "—");
     at.innerHTML =
-      cell("HRV · Deep", val(a.hrv_deep, " ms")) +
-      cell("HRV · Light", val(a.hrv_light, " ms")) +
-      cell("HRV · REM", val(a.hrv_rem, " ms")) +
-      cell("HR · Deep", val(a.hr_deep, " bpm")) +
-      cell("HR · Light", val(a.hr_light, " bpm")) +
-      cell("HR · REM", val(a.hr_rem, " bpm"));
-    root.append(at);
+      mc("HRV · Deep", val(au.hrv_deep, " ms")) +
+      mc("HRV · Light", val(au.hrv_light, " ms")) +
+      mc("HRV · REM", val(au.hrv_rem, " ms")) +
+      mc("HR · Deep", val(au.hr_deep, " bpm")) +
+      mc("HR · Light", val(au.hr_light, " bpm")) +
+      mc("HR · REM", val(au.hr_rem, " bpm"));
+    sec.append(at);
   }
-
-  root.append(el("p", "subhead", "Interpretation"), sleepInterpretation(d, n, m));
-  return root;
+  sec.append(el("p", "subhead", "Interpretation"), sleepInterpretation(d, n, m));
+  return sec;
 }
 
-// 24h movement (MET-above-rest) area chart with hour axis + active-zone shading
-function metProfileSvg(prof, w, h) {
+// 15-minute MET-above-rest buckets across the day's own 24 h, on the day axis
+function movementSvg(prof, axis, w, h) {
   const p = (prof || []).map((x) => x || 0);
   if (p.length < 2) return "";
-  const peak = Math.max(1, ...p), pad = 6;
-  const xOf = (i) => (i / (p.length - 1)) * w;
-  const yOf = (v) => pad + (1 - Math.min(1, v / peak)) * (h - 2 * pad);
-  const pts = p.map((v, i) => [xOf(i), yOf(v)]);
+  const x0 = axis.frac(axis.dayStart) * w, peak = Math.max(1, ...p), pad = 6;
+  const pts = p.map((v, i) => [x0 + ((i + 0.5) / p.length) * (w - x0), pad + (1 - Math.min(1, v / peak)) * (h - 2 * pad)]);
   const line = smoothPath(pts);
-  let grid = "";
-  for (let hr = 0; hr <= 24; hr += 6) { const x = (hr / 24) * w; grid += `<line x1="${x}" y1="0" x2="${x}" y2="${h}" stroke="var(--line-soft)" stroke-width="0.5"/>`; }
-  return `<svg class="met-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}` +
-    `<path d="${line} L${w} ${h} L0 ${h} Z" fill="var(--accent)" opacity="0.14"/>` +
+  const [first, last] = [pts[0][0].toFixed(1), pts[pts.length - 1][0].toFixed(1)];
+  return `<svg class="lane-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">` +
+    `<path d="${line} L${last} ${h} L${first} ${h} Z" fill="var(--accent)" opacity="0.14"/>` +
     `<path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
-function activityReport(d, ymd) {
-  const root = el("div", "rpt-act");
+function activitySection(d, ymd, axis, cursor) {
+  const sec = el("section", "rpt-sec");
+  sec.id = "sec-activity";
+  sec.append(secHead("Activity"));
   const ds = (d.activity_daily || {})[ymd];
   const prof = (d.activity_profile || {})[ymd] || [];
-
   const strip = el("div", "stat-strip");
-  const ss = (k, v) => `<div class="ss"><div class="ss-v">${v}</div><div class="ss-k">${k}</div></div>`;
   strip.innerHTML =
-    ss("Steps", ds ? Math.round(ds.steps || 0).toLocaleString() : "—") +
-    ss("Active energy", ds ? Math.round(ds.active_kcal || 0) + " kcal" : "—") +
-    ss("Total energy", ds ? Math.round(ds.total_kcal || 0) + " kcal" : "—") +
-    (ds && ds.distance_m != null ? ss("Distance", (ds.distance_m / 1000).toFixed(1) + " km") : "");
-  root.append(strip);
+    statTile("Steps", ds ? Math.round(ds.steps || 0).toLocaleString() : "—") +
+    statTile("Active energy", ds ? Math.round(ds.active_kcal || 0) + " kcal" : "—") +
+    statTile("Total energy", ds ? Math.round(ds.total_kcal || 0) + " kcal" : "—") +
+    (ds && ds.distance_m != null ? statTile("Distance", (ds.distance_m / 1000).toFixed(1) + " km") : "");
+  sec.append(strip);
 
-  // 24h movement profile
-  root.append(el("p", "subhead", "Movement across the day"));
-  const met = el("div", "met-wrap");
-  met.innerHTML = metProfileSvg(prof, 1000, 120) +
-    `<div class="met-axis">${[0, 6, 12, 18, 24].map((h) => `<span style="left:${(h / 24 * 100).toFixed(1)}%">${String(h).padStart(2, "0")}</span>`).join("")}</div>`;
-  root.append(met);
+  const svg = movementSvg(prof, axis, 1000, 90);
+  if (svg) {
+    const p = prof.map((v) => v || 0), bucketS = 86400 / p.length;
+    const at = (t) => {
+      const i = Math.floor((t - axis.dayStart) / bucketS);
+      return i >= 0 && i < p.length ? `${p[i].toFixed(1)} MET` : "—";
+    };
+    sec.append(el("p", "subhead", "Movement"),
+      tlBox(axis, cursor, [{ label: "Movement", summary: `peak ${Math.max(...p).toFixed(1)}`, height: 90, html: svg, valueAt: at }]));
+  }
 
   // intensity-derived metrics (buckets are 15-min MET-above-rest)
   const bucketMin = 24 * 60 / (prof.length || 96);
   const activeMin = prof.filter((v) => (v || 0) >= 3).length * bucketMin;
   const lightMin = prof.filter((v) => (v || 0) >= 1.5 && (v || 0) < 3).length * bucketMin;
   const peakMet = prof.length ? Math.max(...prof.map((v) => v || 0)) : 0;
+  const sessions = sessionsForDay(d, ymd);
   const mg = el("div", "metric-grid");
   const mc = (k, v) => `<div class="mc"><div class="mc-v">${v}</div><div class="mc-k">${k}</div></div>`;
   mg.innerHTML =
     mc("Active", Math.round(activeMin) + " min") +
     mc("Lightly active", Math.round(lightMin) + " min") +
     mc("Peak intensity", peakMet.toFixed(1) + " MET") +
-    mc("Sessions", sessionsForDay(d, ymd).length);
-  root.append(mg);
+    mc("Sessions", sessions.length);
+  sec.append(mg);
 
-  // sessions timeline + list
-  const sessions = sessionsForDay(d, ymd);
-  root.append(el("p", "subhead", "Sessions"));
+  sec.append(el("p", "subhead", "Sessions"));
   if (sessions.length) {
     const list = el("div", "dd-sessions");
     sessions.forEach((sess) => {
@@ -857,11 +1237,169 @@ function activityReport(d, ymd) {
       row.addEventListener("click", () => openActDetail(sess));
       list.append(row);
     });
-    root.append(list);
+    sec.append(list);
   } else {
-    root.append(el("div", "ad-muted", "No sessions detected this day."));
+    sec.append(el("div", "ad-muted", "No sessions detected this day."));
   }
-  return root;
+  return sec;
+}
+
+// ── heart rate across the day ────────────────────────────────
+// Mirror of iOS `HeartRate.swift`, finer: one bar per slot spanning its 5th–95th
+// percentile band with a tick at the median, from GET /api/hourly-hr?minutes=
+// (oura-summary::hourly_hr::hr_bins). 15-minute slots by default, hourly on the
+// switch. Slots built from few values are drawn lighter: while you sleep the ring
+// keeps only 5-minute averages, three per quarter hour. Empty slots had no readings.
+let HOURLY_HR = null; // last /api/hourly-hr response, for the day's JSON export
+let HR_BIN_MIN = 15;
+let HR_SEQ = 0;
+const HR_FEW_VALUES = 10; // below this a band is a handful of values, not a spread
+
+// One day's slots from an /api/hourly-hr response: `bySlot[i]` is slot i's row (or
+// null), for the tab chart and the "Your day" strip alike.
+function hrDaySlots(j, ymd) {
+  const m = j.minutes || 60;
+  const slotOf = (r) => Math.floor((r.hour * 60 + (r.minute || 0)) / m);
+  const bySlot = new Array(1440 / m).fill(null);
+  for (const r of j.bins || []) if (r.ymd === ymd) bySlot[slotOf(r)] = r;
+  return { m, slotOf, bySlot, rows: bySlot.filter(Boolean) };
+}
+
+// The newest reading's bpm when it falls on `ymd` (local clock), else null.
+function hrLatestOn(j, ymd) {
+  if (!j.latest) return null;
+  const at = new Date((j.latest.unix + (j.tz_offset || 0) * 3600) * 1000).toISOString().slice(0, 10);
+  return at === ymd ? j.latest.bpm : null;
+}
+
+function hrBinsSvg(bySlot, lo, hi, w, h, withGrid = true) {
+  const y = (v) => h - ((v - lo) / (hi - lo)) * h;
+  const col = w / bySlot.length;
+  const bw = col * (bySlot.length > 24 ? 0.6 : 0.5);
+  let grid = "";
+  for (let v = Math.ceil(lo / 20) * 20; withGrid && v <= hi; v += 20)
+    grid += `<line class="hr-grid" x1="0" x2="${w}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>`;
+  let bars = "";
+  bySlot.forEach((b, i) => {
+    if (!b) return;
+    const x = i * col + (col - bw) / 2, thin = b.count < HR_FEW_VALUES ? " thin" : "";
+    bars += `<rect class="hr-bar${thin}" x="${x.toFixed(2)}" y="${y(b.high).toFixed(1)}" width="${bw.toFixed(2)}" ` +
+      `height="${Math.max(2, y(b.low) - y(b.high)).toFixed(1)}"/>` +
+      `<line class="hr-med${thin}" x1="${(x - col * 0.08).toFixed(2)}" x2="${(x + bw + col * 0.08).toFixed(2)}" ` +
+      `y1="${y(b.median).toFixed(1)}" y2="${y(b.median).toFixed(1)}"/>`;
+  });
+  return `<svg class="hr-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}` +
+    `<rect class="hr-hover" x="0" y="0" width="${col.toFixed(2)}" height="${h}" style="display:none"/>${bars}</svg>`;
+}
+
+
+// the slots of an /api/hourly-hr response placed by time on the day axis
+function hrTimelineSvg(bins, axis, minutes, lo, hi, w, h) {
+  const y = (v) => h - ((v - lo) / (hi - lo)) * h;
+  const slotW = ((minutes * 60) / (axis.t1 - axis.t0)) * w, bw = slotW * (minutes < 60 ? 0.6 : 0.5);
+  let grid = "";
+  for (let v = Math.ceil(lo / 20) * 20; v <= hi; v += 20)
+    grid += `<line class="hr-grid" x1="0" x2="${w}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"/>`;
+  let bars = "";
+  for (const b of bins) {
+    const x = axis.frac(b.unix) * w + (slotW - bw) / 2, thin = b.count < HR_FEW_VALUES ? " thin" : "";
+    bars += `<rect class="hr-bar${thin}" x="${x.toFixed(2)}" y="${y(b.high).toFixed(1)}" width="${bw.toFixed(2)}" ` +
+      `height="${Math.max(2, y(b.low) - y(b.high)).toFixed(1)}"/>` +
+      `<line class="hr-med${thin}" x1="${(x - slotW * 0.08).toFixed(2)}" x2="${(x + bw + slotW * 0.08).toFixed(2)}" ` +
+      `y1="${y(b.median).toFixed(1)}" y2="${y(b.median).toFixed(1)}"/>`;
+  }
+  return `<svg class="hr-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}${bars}</svg>`;
+}
+
+function heartSection(ymd, axis, cursor) {
+  const sec = el("section", "rpt-sec");
+  sec.id = "sec-heart";
+  const sw = el("div", "hr-bin");
+  sec.append(secHead("Heart rate", sw));
+  const strip = el("div", "stat-strip");
+  const chart = el("div");
+  const readout = el("p", "hr-readout", "&nbsp;");
+  sec.append(strip, chart, readout,
+    el("p", "hr-note", "Each bar spans that slot's typical range (5th–95th percentile of its values); the tick is the median. " +
+      "Lighter bars are built from only a few values: while you sleep the ring stores 5-minute averages rather than beats. " +
+      "Empty slots had no readings."));
+  const load = () => {
+    const seq = ++HR_SEQ; // a slower earlier response must not overwrite a newer one
+    sw.querySelectorAll("button").forEach((b) => b.classList.toggle("on", +b.dataset.min === HR_BIN_MIN));
+    chart.replaceChildren(el("div", "skeleton skeleton-block"));
+    fetch(`/api/hourly-hr?minutes=${HR_BIN_MIN}&tz=${browserTzOffset()}`)
+      .then((r) => r.json())
+      .then((j) => {
+        if (seq !== HR_SEQ) return;
+        if (j.error) throw new Error(j.error);
+        HOURLY_HR = j;
+        renderHeart(j, ymd, axis, cursor, strip, chart, readout);
+      })
+      .catch((e) => {
+        if (seq !== HR_SEQ) return;
+        chart.replaceChildren(el("p", "hr-empty", "Couldn't load heart rate: " + esc(e.message)));
+        readout.innerHTML = "&nbsp;";
+      });
+  };
+  for (const [min, label] of [[15, "15 min"], [60, "1 h"]]) {
+    const b = el("button", "", label);
+    b.type = "button";
+    b.dataset.min = min;
+    b.addEventListener("click", () => { if (HR_BIN_MIN !== min) { HR_BIN_MIN = min; load(); } });
+    sw.append(b);
+  }
+  load();
+  return sec;
+}
+
+function renderHeart(j, ymd, axis, cursor, strip, chart, readout) {
+  const span = (j.minutes || 60) * 60;
+  const bins = (j.bins || []).filter((b) => b.unix >= axis.t0 && b.unix < axis.t1);
+  const day = bins.filter((b) => b.ymd === ymd); // the stats cover the day itself
+  if (!bins.length) {
+    strip.innerHTML = "";
+    chart.replaceChildren(el("p", "hr-empty", "No heart-rate readings for this day yet. Wear the ring and sync."));
+    readout.innerHTML = "&nbsp;";
+    cursor.onMove("heart", () => {});
+    return;
+  }
+  const r0 = Math.round;
+  const statRows = day.length ? day : bins;
+  const low = Math.min(...statRows.map((r) => r.low)), high = Math.max(...statRows.map((r) => r.high));
+  const calm = statRows.reduce((a, b) => (b.median < a.median ? b : a));
+  const latest = hrLatestOn(j, ymd);
+  strip.innerHTML =
+    (latest != null ? statTile("Latest", `${r0(latest)} bpm`) : "") +
+    statTile("Range", `${r0(low)}–${r0(high)} bpm`) +
+    statTile(`Lowest · ${axis.clock(calm.unix)}`, `${r0(calm.median)} bpm`) +
+    statTile("Hours measured", `${new Set(statRows.map((r) => `${r.ymd} ${r.hour}`)).size} of 24`);
+
+  const allLow = Math.min(...bins.map((r) => r.low)), allHigh = Math.max(...bins.map((r) => r.high));
+  const lo = Math.max(0, Math.floor(allLow / 10) * 10 - 10), hi = Math.ceil(allHigh / 10) * 10 + 10;
+  const H = 140, rticks = [];
+  for (let v = Math.ceil(lo / 20) * 20; v <= hi; v += 20)
+    rticks.push(`<span style="top:${(((hi - v) / (hi - lo)) * 100).toFixed(1)}%">${v}</span>`);
+  const sorted = statRows.map((r) => r.median).sort((a, b) => a - b);
+  const at = (t) => bins.find((b) => t >= b.unix && t < b.unix + span);
+  chart.replaceChildren(tlBox(axis, cursor, [{
+    label: "Heart rate", summary: `${r0(sorted[Math.floor(sorted.length / 2)])} bpm`, height: H,
+    html: hrTimelineSvg(bins, axis, span / 60, lo, hi, 1000, H), rticks: rticks.join(""),
+    valueAt: (t) => { const b = at(t); return b ? `${r0(b.median)} bpm` : "—"; },
+  }]));
+
+  // the detailed slot line under the chart follows the page cursor from any chart
+  const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+  const madeOf = (b) => [b.beats ? plural(b.beats, "beat") : "", b.averages ? plural(b.averages, "five-minute average") : ""]
+    .filter(Boolean).join(" + ");
+  const idle = "Move over any chart to see that moment across sleep, activity and heart rate.";
+  readout.textContent = idle;
+  cursor.onMove("heart", (t) => {
+    if (t == null) { readout.textContent = idle; return; }
+    const b = at(t), s0 = b ? b.unix : Math.floor(t / span) * span;
+    readout.textContent = `${axis.clock(s0)}–${axis.clock(s0 + span)} · ` + (!b ? "no readings" : b.beats
+      ? `median ${r0(b.median)} bpm · typical ${r0(b.low)}–${r0(b.high)} · min ${r0(b.min)} · max ${r0(b.max)} · ${madeOf(b)}`
+      : `median ${r0(b.median)} bpm · range ${r0(b.min)}–${r0(b.max)} · ${madeOf(b)}`);
+  });
 }
 
 // the "previous days" page: every day as a row (date, mini-hypnogram, totals) that
@@ -938,6 +1476,71 @@ async function doFeature(feature, name, currentOn, row) {
   row.classList.remove("busy");
 }
 
+// The ring's own battery readings (device.battery_history, [unix, percent]) over the
+// days they span. Stretches where the level rises are it charging, which the readings
+// show on their own — the event's two flag bytes aren't decoded, so nothing here
+// depends on guessing what they mean.
+function batteryChart(pts) {
+  if (pts.length < 2) return null;
+  const wrap = el("div", "batt-chart");
+  const head = el("div", "batt-head");
+  head.append(el("p", "subhead", "Battery"));
+  const readout = el("span", "batt-readout");
+  head.append(readout);
+  wrap.append(head);
+
+  const W = 100, H = 40, t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  const span = Math.max(1, t1 - t0);
+  // A full battery is the top of the scale, but the bottom follows the data: a ring
+  // that has only been 80-100% draws as a flat line against a 0-100 axis. Both ends
+  // are labelled so a zoomed axis can't read as a bigger swing than it is.
+  const lo = Math.max(0, Math.floor(Math.min(...pts.map((p) => p[1])) / 10) * 10 - 5), hi = 100;
+  const x = (t) => ((t - t0) / span) * W, y = (p) => H - ((p - lo) / (hi - lo)) * H;
+  // one path per run of the same direction, so charging can be drawn differently
+  const segs = [];
+  for (let i = 1; i < pts.length; i++) {
+    const up = pts[i][1] > pts[i - 1][1];
+    if (!segs.length || segs[segs.length - 1].up !== up) segs.push({ up, pts: [pts[i - 1]] });
+    segs[segs.length - 1].pts.push(pts[i]);
+  }
+  const line = (s) => `<path class="batt-line${s.up ? " up" : ""}" d="${s.pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(2)} ${y(p[1]).toFixed(2)}`).join(" ")}"/>`;
+  let grid = "";
+  for (let v = Math.ceil((lo + 1) / 10) * 10; v < hi; v += 10)
+    grid += `<line class="batt-grid" x1="0" x2="${W}" y1="${y(v).toFixed(2)}" y2="${y(v).toFixed(2)}"/>`;
+  const plot = el("div", "batt-plot",
+    `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${grid}${segs.map(line).join("")}` +
+    `<line class="batt-cursor" x1="0" x2="0" y1="0" y2="${H}" style="display:none"/></svg>` +
+    `<i class="batt-max">${hi}%</i><i class="batt-min">${lo}%</i>`);
+  wrap.append(plot);
+
+  const days = Math.max(1, Math.round((t1 - t0) / 86400));
+  const foot = el("div", "batt-foot");
+  foot.append(el("span", "", `${dayTitle(ymdOf(t0, d0TZ()))} → ${hhmmOf(t1)}`), el("span", "", `${days} day${days === 1 ? "" : "s"}`));
+  wrap.append(foot);
+
+  const cursor = plot.querySelector(".batt-cursor");
+  const at = (e) => {
+    const r = plot.getBoundingClientRect();
+    const t = t0 + Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * span;
+    const p = pts.reduce((a, b) => (Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a));
+    cursor.setAttribute("x1", x(p[0]).toFixed(2));
+    cursor.setAttribute("x2", x(p[0]).toFixed(2));
+    cursor.style.display = "";
+    readout.textContent = `${hhmmOf(p[0])} · ${Math.round(p[1])}%`;
+  };
+  plot.addEventListener("pointermove", at);
+  plot.addEventListener("pointerdown", at);
+  plot.addEventListener("pointerleave", () => { cursor.style.display = "none"; readout.textContent = ""; });
+  return wrap;
+}
+// local-clock helpers for the battery chart's labels (the summary's tz offset)
+const d0TZ = () => (CURRENT_TZ || 0);
+const ymdOf = (unix, tz) => new Date((unix + tz * 3600) * 1000).toISOString().slice(0, 10);
+const hhmmOf = (unix) => {
+  const s = new Date((unix + d0TZ() * 3600) * 1000).toISOString();
+  return `${s.slice(5, 10).replace("-", "/")} ${s.slice(11, 16)}`;
+};
+
 function renderDevice(d) {
   const box = $("device");
   const dev = d.device || {};
@@ -952,8 +1555,10 @@ function renderDevice(d) {
   const fresh = dev.fresh_hours != null ? (dev.fresh_hours < 1 ? "<1" : Math.round(dev.fresh_hours)) : "—";
   stats.append(stat("Last sync", fresh, " h ago"));
   stats.append(stat("History", num(dev.days_of_data), " days"));
-  stats.append(stat("Events", (dev.total_events || 0).toLocaleString()));
+  stats.append(stat("Events", (dev.raw_events ?? dev.total_events ?? 0).toLocaleString()));
   box.append(stats);
+  const battery = batteryChart(dev.battery_history || []);
+  if (battery) box.append(battery);
 
   // left = data streams (what the ring is recording)
   const left = el("div");
@@ -1005,6 +1610,11 @@ function renderDevice(d) {
   ab.append(el("p", "subhead", "Device"));
   const kv = el("div", "adv-kv");
   const kvItem = (k, v) => `<div><i>${k}</i><b>${v}</b></div>`;
+  const rawTotal = dev.raw_events ?? dev.total_events ?? 0;
+  const decodedTotal = dev.decoded_events ?? dev.total_events ?? 0;
+  const historyDetail = `${num(dev.days_of_data)} days elapsed` +
+    (dev.observed_days != null ? ` · ${dev.observed_days} days observed` : "") +
+    (dev.observed_coverage_days != null ? ` (${num(dev.observed_coverage_days)} d active)` : "");
   kv.innerHTML =
     kvItem("Ring ID", esc(dev.serial || "—")) +
     kvItem("Firmware", esc(dev.firmware || "—")) +
@@ -1014,7 +1624,8 @@ function renderDevice(d) {
     kvItem("Battery", dev.battery_v != null ? dev.battery_v + " V" : "—") +
     kvItem("Last sync", `${esc(dev.synced || "—")} ${esc(dev.synced_hm || "")}`) +
     kvItem("Sync cursor", dev.next_cursor != null ? dev.next_cursor.toLocaleString() : "—") +
-    kvItem("History", `${num(dev.days_of_data)} days`);
+    kvItem("History", historyDetail) +
+    kvItem("Events", `${rawTotal.toLocaleString()} raw · ${decodedTotal.toLocaleString()} decoded`);
   ab.append(kv);
 
   // local auth key portability
@@ -1457,6 +2068,78 @@ async function doSync() {
   setTimeout(() => { $("sync-label").textContent = "Sync"; btn.title = "Sync the ring over Bluetooth"; }, 3000);
 }
 
+// ── live heart rate ─────────────────────────────────────────
+// POST /api/live-hr streams newline-delimited JSON while the ring is connected:
+// {"status":"live"}, then {"bpm":..,"ibi_ms":..} per beat, then {"done":true} or
+// {"error":".."}. Aborting the request (Stop) ends the session on the server.
+let LIVE_ABORT = null;
+
+function liveHint(msg) {
+  msg = msg || "";
+  if (/no matching|not found|no device|no ring/i.test(msg))
+    return "Couldn't find your ring. Keep it on your finger, close to the Mac, and try again.";
+  if (/key|auth|unauthor/i.test(msg))
+    return "The ring needs its auth key. Start the dashboard with --key-file.";
+  return "Live heart rate failed: " + msg;
+}
+
+function liveSummary(beats) {
+  if (!beats.length) return "No beats captured. Make sure the ring is on your finger.";
+  const avg = Math.round(beats.reduce((a, b) => a + b, 0) / beats.length);
+  return `${beats.length} beats · avg ${avg} · min ${Math.min(...beats)} · max ${Math.max(...beats)} bpm`;
+}
+
+async function toggleLive() {
+  if (LIVE_ABORT) { LIVE_ABORT.abort(); return; }
+  const abort = (LIVE_ABORT = new AbortController());
+  const beats = [];
+  const status = $("live-status");
+  $("live-btn").classList.add("live-on");
+  $("live-label").textContent = "Stop";
+  $("live-bpm").textContent = "—";
+  $("live-spark").innerHTML = "";
+  status.textContent = "Connecting to the ring… keep your hand near the Mac (up to 2 min).";
+  let end = null;
+  try {
+    const r = await fetch("/api/live-hr", { method: "POST", headers: { ...DASH_HEADERS }, signal: abort.signal });
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const m = JSON.parse(line);
+        if (m.status === "live") status.textContent = "Live. Beats appear as the ring detects them.";
+        else if (m.bpm != null) {
+          beats.push(m.bpm);
+          $("live-bpm").textContent = m.bpm;
+          $("live-spark").innerHTML = sparkline(beats.slice(-60));
+          status.textContent = liveSummary(beats);
+          const dot = $("live-dot");
+          dot.classList.remove("beat");
+          void dot.offsetWidth; // restart the pulse animation
+          dot.classList.add("beat");
+        } else if (m.error) end = liveHint(m.error);
+        else if (m.done) end = beats.length ? "Done. " + liveSummary(beats) : liveSummary(beats);
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") end = beats.length ? "Stopped. " + liveSummary(beats) : "Stopped.";
+    else end = "Couldn't reach the local dashboard server.";
+  }
+  status.textContent = end || liveSummary(beats);
+  LIVE_ABORT = null;
+  $("live-btn").classList.remove("live-on");
+  $("live-label").textContent = "Start";
+}
+
 // ── load ────────────────────────────────────────────────────
 // show the error in the headline and stop every panel's loading shimmer, so the
 // page reads as "errored" rather than stuck mid-load.
@@ -1478,7 +2161,7 @@ async function load() {
   const seq = ++LOAD_SEQ;
   let d;
   try {
-    d = await (await fetch("/api/summary")).json();
+    d = await (await fetch(`/api/summary?tz=${browserTzOffset()}`)).json();
   } catch (e) {
     if (seq === LOAD_SEQ) showLoadError("Could not reach the local server.");
     return;
@@ -1489,12 +2172,14 @@ async function load() {
     return;
   }
   CURRENT_PROFILE = d.profile || null;
+  CURRENT_TZ = d.tz || 0;
   LAST_DEVICE_SERIAL = d.device && d.device.serial;
   $("digest").classList.remove("skeleton", "skeleton-text");
   $("digest").classList.add("reveal");
   $("digest").innerHTML = (d.digest || "").replace(/([+-]?\d[\d.]*\s?(?:%|bpm|ms|m\/s))/g, '<span class="metric">$1</span>');
   renderActions(d);
   renderTiles(d);
+  HR_QUARTER_LOAD = null;
   renderDay(d);
   renderSleepDebt(d);
   renderIllness(d);
@@ -1508,6 +2193,7 @@ async function load() {
 }
 
 $("sync-btn").addEventListener("click", doSync);
+$("live-btn").addEventListener("click", toggleLive);
 $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());

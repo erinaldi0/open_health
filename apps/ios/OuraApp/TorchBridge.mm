@@ -21,6 +21,24 @@
 // plus four models used to race here and abort the process.
 static std::mutex g_torch;
 
+// One loaded module per model, reused across calls (ActivityModel calls once per
+// day) and dropped by oura_torch_release() once a model pass is over. Kept for the
+// process lifetime, they held ~280 MB while the app sat suspended, where iOS
+// terminates the largest apps first under memory pressure.
+struct ModuleSlot {
+    std::unique_ptr<torch::jit::mobile::Module> module;
+    std::string path;
+};
+static ModuleSlot g_sleepnet, g_cva, g_activity, g_stepmotion, g_illness;
+
+void oura_torch_release(void) {
+    std::lock_guard<std::mutex> lock(g_torch);
+    for (ModuleSlot *slot : {&g_sleepnet, &g_cva, &g_activity, &g_stepmotion, &g_illness}) {
+        slot->module.reset();
+        slot->path.clear();
+    }
+}
+
 static torch::jit::mobile::Module &cachedModule(const char *path,
                                                 std::unique_ptr<torch::jit::mobile::Module> &slot,
                                                 std::string &slotPath) {
@@ -46,13 +64,11 @@ int oura_sleepnet(const char *model_path,
                   const int64_t *acm_ts, const float *acm_val, int n_acm,
                   const int64_t *temp_ts, const float *temp_val, int n_temp,
                   int64_t bedtime_start_ms, int64_t bedtime_end_ms,
-                  int *out_stages, int max_out) {
-    if (!model_path || !out_stages || max_out <= 0 || n_ibi <= 0) return -1;
+                  int *out_stages, int64_t *out_timestamps_ms, int max_out) {
+    if (!model_path || !out_stages || !out_timestamps_ms || max_out <= 0 || n_ibi <= 0) return -1;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
-        static std::unique_ptr<torch::jit::mobile::Module> cached;
-        static std::string cached_path;
-        auto &m = cachedModule(model_path, cached, cached_path);
+        auto &m = cachedModule(model_path, g_sleepnet.module, g_sleepnet.path);
 
         auto ibi_ts_t = blobLong(ibi_ts, n_ibi);
         auto ibi_val_t = blobFloat2d(ibi_val, n_ibi, 3);
@@ -79,7 +95,14 @@ int oura_sleepnet(const char *model_path,
             return -1;
         }
         auto col0 = staging.select(1, 0).to(at::kInt).contiguous();
-        int n = std::min<int>((int)col0.numel(), max_out);
+        auto timestamps = out->elements()[0].toTensor().to(at::kLong).reshape({-1}).contiguous();
+        if (timestamps.numel() != col0.numel() || col0.numel() > max_out) {
+            NSLog(@"oura_sleepnet: mismatched timestamps or output exceeds buffer");
+            return -1;
+        }
+        int n = (int)col0.numel();
+        const int64_t *ts = timestamps.data_ptr<int64_t>();
+        for (int i = 0; i < n; i++) out_timestamps_ms[i] = ts[i];
         const int *acc = col0.data_ptr<int>();
         for (int i = 0; i < n; i++) out_stages[i] = acc[i];
         if ((int)col0.numel() > max_out) {
@@ -97,9 +120,7 @@ int oura_cva(const char *model_path, const float *ppg, int n_segs, const float *
     if (!model_path || !ppg || !demo || !out_vascular_age || !out_pwv || n_segs <= 0) return -1;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
-        static std::unique_ptr<torch::jit::mobile::Module> cached;
-        static std::string cached_path;
-        auto &m = cachedModule(model_path, cached, cached_path);
+        auto &m = cachedModule(model_path, g_cva.module, g_cva.path);
         auto ppg_t = blobFloat2d(ppg, n_segs, 1500);
         auto demo_t = blobFloat2d(demo, 1, 5);
         auto out = m.forward({ppg_t, demo_t}).toTuple();
@@ -117,19 +138,29 @@ static at::Tensor mat(const float *p, int rows, int cols) {
     return rows > 0 ? blobFloat2d(p, rows, cols) : at::empty({0, cols}, at::kFloat);
 }
 
+// Swift copies this immediately after a failed synchronous call. Thread-local
+// storage avoids another queued model run overwriting the diagnostic.
+static thread_local std::string activity_error;
+const char *oura_activity_last_error(void) { return activity_error.c_str(); }
+static int activityFailure(const std::string &message) {
+    activity_error = message;
+    NSLog(@"%s", message.c_str());
+    return -1;
+}
+
 int oura_activity(const char *model_path, const float *context, const float *user,
                   const float *met, int n_met, const float *step, int n_step,
                   const float *motion, int n_motion,
                   const float *temp, int n_temp, const float *hr, int n_hr,
                   float threshold, float min_duration, float *out_workouts, int max_rows) {
-    if (!model_path || !context || !user || !out_workouts || max_rows <= 0) return -1;
+    activity_error.clear();
+    if (!model_path || !context || !user || !out_workouts || max_rows <= 0)
+        return activityFailure("activity: invalid model inputs or output buffer");
     std::lock_guard<std::mutex> lock(g_torch);
     try {
         // ActivityModel calls once per retained local day. Loading the 15 MB module
-        // for every day dominated sync time, so retain it for the process lifetime.
-        static std::unique_ptr<torch::jit::mobile::Module> cached;
-        static std::string cached_path;
-        auto &m = cachedModule(model_path, cached, cached_path);
+        // for every day dominated sync time, so keep it until oura_torch_release().
+        auto &m = cachedModule(model_path, g_activity.module, g_activity.path);
         auto context_t = at::from_blob((void *)context, {4}, at::kFloat).clone();
         auto user_t = at::from_blob((void *)user, {14}, at::kFloat).clone();
         auto met_t = mat(met, n_met, 2);
@@ -148,8 +179,7 @@ int oura_activity(const char *model_path, const float *context, const float *use
         auto workouts = out->elements()[0].toTensor().to(at::kFloat).contiguous();
         if (!workouts.defined() || workouts.numel() == 0) return 0;
         if (workouts.dim() != 2 || workouts.size(1) != 9) {
-            NSLog(@"oura_activity: unexpected workouts shape dim=%d", (int)workouts.dim());
-            return -1;
+            return activityFailure("activity: expected a workouts tensor with 9 columns, got rank " + std::to_string(workouts.dim()));
         }
         int n = std::min<int>((int)workouts.size(0), max_rows);
         const float *wp = workouts.data_ptr<float>();
@@ -159,21 +189,20 @@ int oura_activity(const char *model_path, const float *context, const float *use
         }
         return n;
     } catch (const std::exception &e) {
-        NSLog(@"oura_activity: %s", e.what());
-        return -1;
+        return activityFailure(std::string("activity: ") + e.what());
     }
 }
 
 int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
                     const float *raw, int n_raw, int64_t *out_timestamps_ms,
                     float *out_features, int max_rows) {
-    if (!model_path || !timestamps_ms || !raw || !out_timestamps_ms || !out_features) return -1;
+    activity_error.clear();
+    if (!model_path || !timestamps_ms || !raw || !out_timestamps_ms || !out_features)
+        return activityFailure("step decoder: invalid model inputs or output buffer");
     if (n_raw <= 0 || max_rows <= 0) return 0;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
-        static std::unique_ptr<torch::jit::mobile::Module> cached;
-        static std::string cached_path;
-        auto &m = cachedModule(model_path, cached, cached_path);
+        auto &m = cachedModule(model_path, g_stepmotion.module, g_stepmotion.path);
         auto timestamps = blobLong(timestamps_ms, n_raw);
         auto data = blobFloat2d(raw, n_raw, 27);
         auto result = m.forward({timestamps, data}).toTuple();
@@ -181,8 +210,7 @@ int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
         auto out_data = result->elements()[1].toTensor().to(at::kFloat).contiguous();
         if (!out_data.defined() || out_data.numel() == 0) return 0;
         if (out_data.dim() != 2 || out_data.size(1) != 11) {
-            NSLog(@"oura_stepmotion: unexpected feature shape dim=%d", (int)out_data.dim());
-            return -1;
+            return activityFailure("step decoder: expected a feature tensor with 11 columns, got rank " + std::to_string(out_data.dim()));
         }
         int n = std::min<int>((int)out_data.size(0), max_rows);
         n = std::min<int>(n, (int)out_ts.numel());
@@ -195,8 +223,7 @@ int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
         }
         return n;
     } catch (const std::exception &e) {
-        NSLog(@"oura_stepmotion: %s", e.what());
-        return -1;
+        return activityFailure(std::string("step decoder: ") + e.what());
     }
 }
 
@@ -205,9 +232,7 @@ int oura_illness(const char *model_path, const float *series, const float *scala
     if (!model_path || !series || !scalars || !out_score || !out_decision || !out_biomarkers) return -1;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
-        static std::unique_ptr<torch::jit::mobile::Module> cached;
-        static std::string cached_path;
-        auto &m = cachedModule(model_path, cached, cached_path);
+        auto &m = cachedModule(model_path, g_illness.module, g_illness.path);
         const float nan = std::numeric_limits<float>::quiet_NaN();
         // 7 daily series -> [30,1] columns (index 0 = today)
         auto colf = [&](int k) { return blobFloat2d(series + k * 30, 30, 1); };

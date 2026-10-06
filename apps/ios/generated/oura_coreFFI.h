@@ -258,6 +258,20 @@ typedef void (*UniffiCallbackInterfaceBleWriterMethod0)(uint64_t, RustBuffer, vo
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_HEART_RATE_LISTENER_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_HEART_RATE_LISTENER_METHOD0
+typedef void (*UniffiCallbackInterfaceHeartRateListenerMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_HEART_RATE_LISTENER_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_HEART_RATE_LISTENER_METHOD1
+typedef void (*UniffiCallbackInterfaceHeartRateListenerMethod1)(uint64_t, uint16_t, uint16_t, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SYNC_PROGRESS_LISTENER_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SYNC_PROGRESS_LISTENER_METHOD0
 typedef void (*UniffiCallbackInterfaceSyncProgressListenerMethod0)(uint64_t, RustBuffer, uint64_t, uint32_t, void* _Nonnull, 
@@ -271,6 +285,15 @@ typedef struct UniffiVTableCallbackInterfaceBleWriter {
     UniffiCallbackInterfaceBleWriterMethod0 _Nonnull write;
     UniffiCallbackInterfaceFree _Nonnull uniffiFree;
 } UniffiVTableCallbackInterfaceBleWriter;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_HEART_RATE_LISTENER
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_HEART_RATE_LISTENER
+typedef struct UniffiVTableCallbackInterfaceHeartRateListener {
+    UniffiCallbackInterfaceHeartRateListenerMethod0 _Nonnull onStatus;
+    UniffiCallbackInterfaceHeartRateListenerMethod1 _Nonnull onSample;
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+} UniffiVTableCallbackInterfaceHeartRateListener;
 
 #endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_SYNC_PROGRESS_LISTENER
@@ -296,9 +319,34 @@ void uniffi_oura_core_fn_free_ringsession(void*_Nonnull ptr, RustCallStatus *_No
 void*_Nonnull uniffi_oura_core_fn_constructor_ringsession_new(uint64_t writer, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_CANCEL
+void uniffi_oura_core_fn_method_ringsession_cancel(void*_Nonnull ptr, RustBuffer reason, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_FACTORY_RESET
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_FACTORY_RESET
+uint64_t uniffi_oura_core_fn_method_ringsession_factory_reset(void*_Nonnull ptr, RustBuffer key_hex, RustBuffer confirm_serial
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_LIVE_HEART_RATE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_LIVE_HEART_RATE
+uint64_t uniffi_oura_core_fn_method_ringsession_live_heart_rate(void*_Nonnull ptr, RustBuffer key_hex, uint32_t max_seconds, uint64_t listener
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+uint64_t uniffi_oura_core_fn_method_ringsession_pair(void*_Nonnull ptr, RustBuffer existing_key_hex
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 void uniffi_oura_core_fn_method_ringsession_push_frame(void*_Nonnull ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_STOP_LIVE_HEART_RATE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_STOP_LIVE_HEART_RATE
+void uniffi_oura_core_fn_method_ringsession_stop_live_heart_rate(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_SYNC
@@ -311,15 +359,45 @@ uint64_t uniffi_oura_core_fn_method_ringsession_sync(void*_Nonnull ptr, RustBuff
 void uniffi_oura_core_fn_init_callback_vtable_blewriter(UniffiVTableCallbackInterfaceBleWriter* _Nonnull vtable
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_INIT_CALLBACK_VTABLE_HEARTRATELISTENER
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_INIT_CALLBACK_VTABLE_HEARTRATELISTENER
+void uniffi_oura_core_fn_init_callback_vtable_heartratelistener(UniffiVTableCallbackInterfaceHeartRateListener* _Nonnull vtable
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_INIT_CALLBACK_VTABLE_SYNCPROGRESSLISTENER
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_INIT_CALLBACK_VTABLE_SYNCPROGRESSLISTENER
 void uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(UniffiVTableCallbackInterfaceSyncProgressListener* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+uint64_t uniffi_oura_core_fn_func_backup_database(RustBuffer db_path, RustBuffer dest_path, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
+RustBuffer uniffi_oura_core_fn_func_database_integrity(RustBuffer db_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+RustBuffer uniffi_oura_core_fn_func_events_json(RustBuffer db_path, RustBuffer name_filter, uint32_t limit, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
+void uniffi_oura_core_fn_func_export_database(RustBuffer db_path, RustBuffer out_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_HOURLY_HR_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_HOURLY_HR_JSON
+RustBuffer uniffi_oura_core_fn_func_hourly_hr_json(RustBuffer db_path, int64_t tz_offset, uint32_t days, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
@@ -617,9 +695,39 @@ void ffi_oura_core_rust_future_free_void(uint64_t handle
 void ffi_oura_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+uint16_t uniffi_oura_core_checksum_func_backup_database(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 uint16_t uniffi_oura_core_checksum_func_core_version(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
+uint16_t uniffi_oura_core_checksum_func_database_integrity(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+uint16_t uniffi_oura_core_checksum_func_events_json(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
+uint16_t uniffi_oura_core_checksum_func_export_database(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
+uint16_t uniffi_oura_core_checksum_func_hourly_hr_json(void
     
 );
 #endif
@@ -641,9 +749,39 @@ uint16_t uniffi_oura_core_checksum_func_summary_json(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
+uint16_t uniffi_oura_core_checksum_method_ringsession_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_FACTORY_RESET
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_FACTORY_RESET
+uint16_t uniffi_oura_core_checksum_method_ringsession_factory_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_LIVE_HEART_RATE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_LIVE_HEART_RATE
+uint16_t uniffi_oura_core_checksum_method_ringsession_live_heart_rate(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+uint16_t uniffi_oura_core_checksum_method_ringsession_pair(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME
 uint16_t uniffi_oura_core_checksum_method_ringsession_push_frame(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_STOP_LIVE_HEART_RATE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_STOP_LIVE_HEART_RATE
+uint16_t uniffi_oura_core_checksum_method_ringsession_stop_live_heart_rate(void
     
 );
 #endif
@@ -662,6 +800,18 @@ uint16_t uniffi_oura_core_checksum_constructor_ringsession_new(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_BLEWRITER_WRITE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_BLEWRITER_WRITE
 uint16_t uniffi_oura_core_checksum_method_blewriter_write(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_HEARTRATELISTENER_ON_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_HEARTRATELISTENER_ON_STATUS
+uint16_t uniffi_oura_core_checksum_method_heartratelistener_on_status(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_HEARTRATELISTENER_ON_SAMPLE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_HEARTRATELISTENER_ON_SAMPLE
+uint16_t uniffi_oura_core_checksum_method_heartratelistener_on_sample(void
     
 );
 #endif

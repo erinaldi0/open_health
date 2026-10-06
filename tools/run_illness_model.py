@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from epoch_time import build_epochs, make_unix_s
+from epoch_time import build_epochs, is_dated, make_unix_s
 from respiratory_rate import respiratory_rate
 
 REPO = Path(__file__).resolve().parent.parent
@@ -183,8 +183,10 @@ def series(per_day, sed, rest, anchor):
     # nightly temp deviation vs personal baseline (median of available skin temps)
     base_temp = np.nanmedian(skin) if np.isfinite(skin).any() else nan
     temp_dev = (skin - base_temp).reshape(N_DAYS, 1).astype(np.float32)
-    sed_c = col(lambda d: float(sed.get(d, nan)))
-    rest_c = col(lambda d: float(rest.get(d, nan)))
+    # Oura pairs each night with the full day before it (activityMap.get(day.minusDays(1))),
+    # not the wake day's partial morning — see illness-detection.md §2.
+    sed_c = col(lambda d: float(sed.get(d - 1, nan)))
+    rest_c = col(lambda d: float(rest.get(d - 1, nan)))
     return breath, avg_hr, low_hr, hrv, temp_dev, sed_c, rest_c, skin, base_temp
 
 
@@ -200,6 +202,9 @@ def run(db, tz, profile):
         return {"available": False, "status": "NO_DATA"}
     epochs = build_epochs(rows)
     unix_s = make_unix_s(epochs)
+    # Undated data (an untrustworthy boot clock) belongs to no night or day; mirrors
+    # the shared summary and the iOS IllnessModel.
+    rows = [row for row in rows if is_dated(epochs, row[0], row[3])]
 
     windows = bed_windows(rows, unix_s)
     per_day = nightly_biometrics(rows, unix_s, tz, windows)

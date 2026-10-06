@@ -43,3 +43,11 @@ apps/android/local.properties
 apps/android/.ndk-shim/
 apps/android/clang-resource/
 tools/frida/*.compiled.js
+
+# Runtime state the CLI writes next to the DB (personal profile, ring feature modes).
+profile.json
+feature_modes.json
+
+# Python research/test bytecode
+__pycache__/
+apps/ios/OuraApp/project-model-validation.yml

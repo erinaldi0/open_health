@@ -14,10 +14,13 @@ use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use oura_summary::{feature_modes_path, profile_path, ModelInputs, ModelOutputs, ModelRunner};
+use oura_summary::{
+    bedtime_overrides_path, feature_modes_path, profile_path, write_bedtime_override, ModelInputs,
+    ModelOutputs, ModelRunner,
+};
 // Re-exported so `dashboard::Demographics` (main.rs) and the profile/feature
 // handlers keep working after the summary logic moved into `oura-summary`.
 pub use oura_summary::{read_profile, write_feature_mode, write_profile, Demographics};
@@ -69,51 +72,95 @@ fn python_bin(root: &Path) -> PathBuf {
     crate::pyrunner::venv_python(root)
 }
 
-/// Run a python runner and parse its `--json` stdout. Returns None on any failure
-/// (missing venv/model, night with no data, …) so the dashboard degrades softly.
-fn run_py_json(root: &Path, py: &Path, script: &str, args: &[String]) -> Option<Value> {
-    let out = Command::new(py)
-        .current_dir(root)
-        .arg(root.join(script))
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+/// Bound model subprocesses and drain stdout concurrently (large results must not
+/// fill the pipe while the parent waits). A stalled runner is killed and reaped.
+fn model_output(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> Option<Value> {
+    use std::io::{Read, Write};
+    command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(32 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    if let Some(input) = input {
+        if child
+            .stdin
+            .take()
+            .and_then(|mut pipe| pipe.write_all(input).ok())
+            .is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return None;
+        }
+    }
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                tracing::warn!("model runner timed out or could not be monitored");
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?.ok()?;
+    if !status?.success() {
         return None;
     }
-    serde_json::from_slice(&out.stdout).ok()
+    serde_json::from_slice(&bytes).ok()
 }
 
-/// Like `run_py_json` but feeds `stdin` to the process — used for the batched sleep
-/// runner, which reads its list of night ranges from stdin. The payload is small
-/// (a few night pairs), so writing it before draining stdout can't deadlock.
+fn run_py_json(root: &Path, py: &Path, script: &str, args: &[String]) -> Option<Value> {
+    run_py_json_stdin_optional(root, py, script, args, None)
+}
+
 fn run_py_json_stdin(
     root: &Path,
     py: &Path,
     script: &str,
     args: &[String],
-    stdin: &[u8],
+    input: &[u8],
 ) -> Option<Value> {
-    use std::io::Write;
-    let mut child = Command::new(py)
-        .current_dir(root)
-        .arg(root.join(script))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(stdin).ok()?; // dropped here → EOF
-    let out = child.wait_with_output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
+    run_py_json_stdin_optional(root, py, script, args, Some(input))
+}
+
+fn run_py_json_stdin_optional(
+    root: &Path,
+    py: &Path,
+    script: &str,
+    args: &[String],
+    input: Option<&[u8]>,
+) -> Option<Value> {
+    let mut command = Command::new(py);
+    command.current_dir(root).arg(root.join(script)).args(args);
+    model_output(command, input, std::time::Duration::from_secs(180))
 }
 
 /// The web dashboard's [`ModelRunner`]: shells out to the Python torch runners,
-/// exactly as before. The native client supplies an on-device `.ptl` runner.
+/// exactly as before, and falls back to Rust signal-based sleep staging when the
+/// Python environment or private `.pt` model file is unavailable on a user's PC.
 struct PythonRunner;
 impl ModelRunner for PythonRunner {
     fn run(&self, input: ModelInputs) -> ModelOutputs {
@@ -152,13 +199,9 @@ impl ModelRunner for PythonRunner {
             tz.to_string(),
             "--json".into(),
         ];
-        let illness_args = vec![
-            db.display().to_string(),
-            tz.to_string(),
-            "--json".into(),
-        ];
+        let illness_args = vec![db.display().to_string(), tz.to_string(), "--json".into()];
 
-        let (sleep_batch, cva, activity, illness) = match (root.as_deref(), py.as_deref()) {
+        let (mut sleep_batch, cva, activity, illness) = match (root.as_deref(), py.as_deref()) {
             (Some(r), Some(p)) => std::thread::scope(|s| {
                 let sh = s.spawn(|| {
                     run_py_json_stdin(r, p, "tools/run_sleep_model.py", &sleep_args, &sleep_stdin)
@@ -175,6 +218,13 @@ impl ModelRunner for PythonRunner {
             }),
             _ => (None, None, None, None),
         };
+        let needs_fallback = sleep_batch
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty());
+        if needs_fallback && !sleep_ranges.is_empty() {
+            sleep_batch = oura_summary::stage_nights_from_signals(db, sleep_ranges);
+        }
         ModelOutputs {
             sleep_batch,
             cva,
@@ -185,7 +235,7 @@ impl ModelRunner for PythonRunner {
 }
 
 /// `build_summary` for the web dashboard — runs the models via Python.
-fn build_summary(db: &Path, tz: i64) -> Result<Value> {
+fn build_summary(db: &Path, tz: f64) -> Result<Value> {
     oura_summary::build_summary(db, tz, &PythonRunner)
 }
 
@@ -197,20 +247,30 @@ fn build_summary(db: &Path, tz: i64) -> Result<Value> {
 // edit transparently invalidates the cache with no explicit wiring.
 struct SummaryCache {
     db: PathBuf,
-    tz: i64,
-    token: CacheToken, // (db, profile.json, feature_modes.json) mtimes
+    tz: f64,
+    token: CacheToken, // (db, profile.json, feature_modes.json, bedtime_overrides.json) mtimes
     value: Arc<Value>,
 }
 
-type CacheToken = (Option<SystemTime>, Option<SystemTime>, Option<SystemTime>);
+type CacheToken = (
+    Option<SystemTime>,
+    Option<SystemTime>,
+    Option<SystemTime>,
+    Option<SystemTime>,
+    i64,
+);
 
-/// mtimes of every input the summary depends on — any change rebuilds it. Covers a
-/// sync (oura.db), a profile edit (profile.json), and a feature toggle (feature_modes.json).
+/// mtimes of every input the summary depends on plus the store decoder version — any
+/// change rebuilds it. Covers a sync (oura.db), a profile edit (profile.json), a
+/// feature toggle (feature_modes.json), a manual bedtime adjustment
+/// (bedtime_overrides.json), and historical decode migrations.
 fn summary_token(db: &Path) -> CacheToken {
     (
         mtime(db),
         mtime(&profile_path(db)),
         mtime(&feature_modes_path(db)),
+        mtime(&bedtime_overrides_path(db)),
+        oura_store::storage::DECODER_VERSION,
     )
 }
 
@@ -225,7 +285,8 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 
 /// Cached `build_summary`: recompute only when oura.db, profile.json, or
 /// feature_modes.json changes.
-fn cached_summary(db: &Path, tz: i64) -> Result<Arc<Value>> {
+fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
+    let _ = oura_store::storage::Store::migrate_if_writable(db);
     let token = summary_token(db);
     if let Some(c) = summary_cache().lock().unwrap().as_ref() {
         if c.db == db && c.tz == tz && c.token == token {
@@ -260,7 +321,7 @@ fn cached_summary(db: &Path, tz: i64) -> Result<Arc<Value>> {
 pub async fn serve(
     port: u16,
     db: PathBuf,
-    tz: i64,
+    tz: f64,
     name: String,
     key_file: Option<PathBuf>,
     seed: Demographics,
@@ -367,7 +428,7 @@ async fn handle(
     mut sock: TcpStream,
     port: u16,
     db: PathBuf,
-    tz: i64,
+    tz: f64,
     name: String,
     key_file: Option<PathBuf>,
 ) -> Result<()> {
@@ -408,7 +469,9 @@ async fn handle(
     let forbid = matches!(
         (method, path),
         ("POST", "/api/profile")
+            | ("POST", "/api/bedtime")
             | ("POST", "/api/sync")
+            | ("POST", "/api/live-hr")
             | ("POST", "/api/feature")
             | ("POST", "/api/ring-key")
             | ("GET", "/api/ring-key")
@@ -420,6 +483,33 @@ async fn handle(
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
 
+    // A dashboard can own only one BLE operation at a time.
+    static BLE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _ble_guard = if method == "POST"
+        && matches!(path, "/api/sync" | "/api/live-hr" | "/api/feature")
+    {
+        match BLE_GATE.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                let busy = json!({"ok": false, "error": "Ring is busy; wait for the current operation to finish.", "message": "Ring is busy; wait for the current operation to finish."});
+                if path == "/api/live-hr" {
+                    // The live client consumes newline-delimited records.
+                    return write_resp(&mut sock, "200 OK", "application/x-ndjson", format!("{busy}\n").as_bytes()).await;
+                }
+                return json_resp(&mut sock, &busy).await;
+            }
+        }
+    } else {
+        None
+    };
+    let effective_tz = if tz == 0.0 {
+        query_param(query, "tz")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|h| h.is_finite() && (-24.0..=24.0).contains(h))
+            .unwrap_or(tz)
+    } else {
+        tz
+    };
     match (method, path) {
         (_, "/") | (_, "/index.html") => {
             write_resp(
@@ -561,9 +651,28 @@ async fn handle(
         ("GET", "/api/summary") => {
             // building the summary shells out to torch models → off the async
             // executor; cached so only the first load (or post-sync/edit) pays for it.
-            let body = tokio::task::spawn_blocking(move || cached_summary(&db, tz))
+            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz))
                 .await
                 .map_err(|e| anyhow!(e))?;
+            match body {
+                Ok(v) => json_resp(&mut sock, &v).await,
+                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+            }
+        }
+        ("GET", "/api/hourly-hr") => {
+            // HR bars per `minutes` slot (default hourly, the iOS HeartRate screen's
+            // data); `days` = 0 → all of them, the day page picks out the day it shows
+            let days = query_param(query, "days")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let minutes = query_param(query, "minutes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60);
+            let body = tokio::task::spawn_blocking(move || {
+                oura_summary::hourly_hr::hr_bins(&db, effective_tz, days, minutes)
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
             match body {
                 Ok(v) => json_resp(&mut sock, &v).await,
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
@@ -577,6 +686,40 @@ async fn handle(
                     Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
                 },
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+            }
+        }
+        ("POST", "/api/bedtime") => {
+            let req =
+                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
+            let raw_start_ds = req["raw_start_ds"].as_i64();
+            let captured_unix = req["captured_unix"].as_i64();
+            let reset = req["reset"].as_bool().unwrap_or(false);
+            let (start_ds, end_ds) = if reset {
+                (None, None)
+            } else {
+                match (req["start_ds"].as_i64(), req["end_ds"].as_i64()) {
+                    (Some(s), Some(e)) => (Some(s), Some(e)),
+                    _ => {
+                        return json_resp(
+                            &mut sock,
+                            &json!({ "ok": false, "error": "start_ds and end_ds are required" }),
+                        )
+                        .await;
+                    }
+                }
+            };
+            let Some(raw_start_ds) = raw_start_ds else {
+                return json_resp(
+                    &mut sock,
+                    &json!({ "ok": false, "error": "raw_start_ds is required" }),
+                )
+                .await;
+            };
+            match write_bedtime_override(&db, raw_start_ds, captured_unix, start_ds, end_ds) {
+                Ok(v) => json_resp(&mut sock, &v).await,
+                Err(e) => {
+                    json_resp(&mut sock, &json!({ "ok": false, "error": e.to_string() })).await
+                }
             }
         }
         ("GET", "/api/ring-key") => match read_ring_key(key_file.as_deref()) {
@@ -604,6 +747,7 @@ async fn handle(
             };
             json_resp(&mut sock, &v).await
         }
+        ("POST", "/api/live-hr") => live_hr(&mut sock, &db, &name, key_file.as_deref()).await,
         ("POST", "/api/feature") => {
             let req =
                 serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
@@ -673,6 +817,124 @@ fn run_sync(db: &Path, name: &str, key_file: Option<&Path>) -> Result<String> {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
     Err(anyhow!("{last}"))
+}
+
+/// How long one dashboard live heart-rate session streams (the page can stop it early).
+const LIVE_HR_SECONDS: u64 = 60;
+
+/// Stream live heart rate as newline-delimited JSON while our own `live-hr`
+/// subcommand runs (BLE stays in the CLI, as for sync). Lines: `{"status":"live"}`
+/// once connected, `{"bpm":..,"ibi_ms":..}` per beat, then `{"done":true}` or
+/// `{"error":".."}`; the body ends with the connection. If the page stops early the
+/// child is killed, and the ring leaves live mode on its own within ~20 s.
+async fn live_hr(
+    sock: &mut TcpStream,
+    db: &Path,
+    name: &str,
+    key_file: Option<&Path>,
+) -> Result<()> {
+    sock.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    )
+    .await?;
+    let (mut rd, mut wr) = sock.split();
+    let Some(key_file) = key_file else {
+        let msg = "live heart rate needs the ring's auth key: start the dashboard with --key-file";
+        return send_line(&mut wr, &json!({ "error": msg })).await;
+    };
+    let exe = std::env::current_exe().context("locating oura binary")?;
+    let mut child = tokio::process::Command::new(&exe)
+        .arg("--db")
+        .arg(db)
+        .arg("--name")
+        .arg(name)
+        .arg("--scan-timeout")
+        .arg("120") // a worn ring advertises only in sparse bursts
+        .arg("--key-file")
+        .arg(key_file)
+        .arg("live-hr")
+        .arg("--seconds")
+        .arg(LIVE_HR_SECONDS.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("running `oura live-hr`")?;
+    let stderr = child.stderr.take().context("child stderr")?;
+    let stderr_task = tokio::spawn(read_stderr_tail(stderr));
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().context("child stdout")?).lines();
+    let mut probe = [0u8; 1];
+    let session = tokio::time::timeout(std::time::Duration::from_secs(210), async {
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line? else { break };
+                    let msg = if line.starts_with("Streaming live heart rate") {
+                        json!({ "status": "live" })
+                    } else if let Some((bpm, ibi_ms)) = parse_beat_line(&line) {
+                        json!({ "bpm": bpm, "ibi_ms": ibi_ms })
+                    } else { continue };
+                    send_line(&mut wr, &msg).await?;
+                }
+                n = rd.read(&mut probe) => if matches!(n, Ok(0) | Err(_)) {
+                    return Err(anyhow!("client disconnected"));
+                },
+            }
+        }
+        Ok::<_, anyhow::Error>(child.wait().await?.success())
+    })
+    .await;
+    let ok = match session {
+        Ok(Ok(ok)) => ok,
+        _ => {
+            // Retain the BLE gate until the process is killed and reaped.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return send_line(
+                &mut wr,
+                &json!({"error": "Live heart rate stopped or timed out."}),
+            )
+            .await;
+        }
+    };
+    let stderr = stderr_task.await.unwrap_or_default();
+    let last = if ok {
+        json!({ "done": true })
+    } else {
+        let msg = stderr
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .unwrap_or("live heart rate failed");
+        json!({ "error": msg.trim() })
+    };
+    send_line(&mut wr, &last).await
+}
+
+async fn read_stderr_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
+    let mut tail = Vec::new();
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = reader.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > 8192 {
+            tail.drain(..tail.len() - 8192);
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+async fn send_line(wr: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<()> {
+    wr.write_all(format!("{v}\n").as_bytes()).await?;
+    Ok(())
+}
+
+/// Parse one `oura live-hr` beat line, e.g. `  81 bpm (IBI 733 ms)`.
+fn parse_beat_line(line: &str) -> Option<(u16, u16)> {
+    let (bpm, ibi) = line.trim().strip_suffix(" ms)")?.split_once(" bpm (IBI ")?;
+    Some((bpm.parse().ok()?, ibi.parse().ok()?))
 }
 
 /// Toggle an on-ring feature via our `feature-mode` subcommand (BLE, auth-gated).
@@ -758,4 +1020,48 @@ fn run_feature(
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
     Err(anyhow!("{last}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn live_stderr_is_drained_without_unbounded_retention() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 200000]).await.unwrap();
+            writer.write_all(b"\nlast error\n").await.unwrap();
+        });
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(2), read_stderr_tail(reader)).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(tail.len(), 8192);
+        assert!(tail.ends_with("last error\n"));
+    }
+
+    #[test]
+    fn stalled_runner_is_killed_and_reaped() {
+        let mut command = Command::new("python3");
+        command.args(["-c", "import time; time.sleep(30)"]);
+        assert!(model_output(command, None, std::time::Duration::from_millis(60)).is_none());
+    }
+    #[test]
+    fn large_runner_output_does_not_deadlock_and_input_reaches_eof() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import json,sys; print(json.dumps({'input':sys.stdin.read(),'data':'x'*200000}))",
+        ]);
+        let value =
+            model_output(command, Some(b"window"), std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(value["input"], "window");
+        assert_eq!(value["data"].as_str().unwrap().len(), 200000);
+    }
+    #[test]
+    fn parses_live_hr_beat_lines() {
+        assert_eq!(parse_beat_line("  81 bpm (IBI 733 ms)"), Some((81, 733)));
+        assert_eq!(
+            parse_beat_line("No beats captured. Make sure the ring is worn."),
+            None
+        );
+    }
 }

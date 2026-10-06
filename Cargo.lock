@@ -576,7 +576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1272,7 +1272,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "oura-analysis"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=b1b52a0da36a592d5fe8967b0024dcc40d5c746f#b1b52a0da36a592d5fe8967b0024dcc40d5c746f"
+source = "git+https://github.com/Th0rgal/open_oura?rev=4f7957d3304c4084f0e1e703f3d84606bf10b781#4f7957d3304c4084f0e1e703f3d84606bf10b781"
 dependencies = [
  "oura-protocol",
  "serde",
@@ -1285,7 +1285,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.3.4",
  "hex",
+ "libc",
  "oura-dna",
  "oura-link",
  "oura-protocol",
@@ -1307,11 +1309,13 @@ name = "oura-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.2.17",
  "oura-analysis",
  "oura-link",
  "oura-protocol",
  "oura-store",
  "oura-summary",
+ "rusqlite",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
@@ -1338,7 +1342,7 @@ dependencies = [
 [[package]]
 name = "oura-link"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=b1b52a0da36a592d5fe8967b0024dcc40d5c746f#b1b52a0da36a592d5fe8967b0024dcc40d5c746f"
+source = "git+https://github.com/Th0rgal/open_oura?rev=4f7957d3304c4084f0e1e703f3d84606bf10b781#4f7957d3304c4084f0e1e703f3d84606bf10b781"
 dependencies = [
  "async-trait",
  "btleplug",
@@ -1354,7 +1358,7 @@ dependencies = [
 [[package]]
 name = "oura-protocol"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=b1b52a0da36a592d5fe8967b0024dcc40d5c746f#b1b52a0da36a592d5fe8967b0024dcc40d5c746f"
+source = "git+https://github.com/Th0rgal/open_oura?rev=4f7957d3304c4084f0e1e703f3d84606bf10b781#4f7957d3304c4084f0e1e703f3d84606bf10b781"
 dependencies = [
  "aes",
  "hex",
@@ -1366,7 +1370,6 @@ dependencies = [
 [[package]]
 name = "oura-store"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=b1b52a0da36a592d5fe8967b0024dcc40d5c746f#b1b52a0da36a592d5fe8967b0024dcc40d5c746f"
 dependencies = [
  "oura-protocol",
  "rusqlite",
@@ -1382,6 +1385,7 @@ dependencies = [
  "oura-analysis",
  "oura-protocol",
  "oura-store",
+ "rusqlite",
  "serde_json",
 ]
 
@@ -2462,7 +2466,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

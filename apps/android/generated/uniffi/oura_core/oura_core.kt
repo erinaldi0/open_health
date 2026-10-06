@@ -811,6 +811,22 @@ internal open class UniffiVTableCallbackInterfaceSyncProgressListener(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -839,7 +855,13 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_oura_core_fn_constructor_ringsession_new(`writer`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_oura_core_fn_method_ringsession_cancel(`ptr`: Pointer,`reason`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_oura_core_fn_method_ringsession_factory_reset(`ptr`: Pointer,`keyHex`: RustBuffer.ByValue,`confirmSerial`: RustBuffer.ByValue,
+    ): Long
     fun uniffi_oura_core_fn_method_ringsession_live_heart_rate(`ptr`: Pointer,`keyHex`: RustBuffer.ByValue,`maxSeconds`: Int,`listener`: Long,
+    ): Long
+    fun uniffi_oura_core_fn_method_ringsession_pair(`ptr`: Pointer,`existingKeyHex`: RustBuffer.ByValue,
     ): Long
     fun uniffi_oura_core_fn_method_ringsession_push_frame(`ptr`: Pointer,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -853,7 +875,17 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(`vtable`: UniffiVTableCallbackInterfaceSyncProgressListener,
     ): Unit
+    fun uniffi_oura_core_fn_func_backup_database(`dbPath`: RustBuffer.ByValue,`destPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     fun uniffi_oura_core_fn_func_core_version(uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_oura_core_fn_func_database_integrity(`dbPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_oura_core_fn_func_events_json(`dbPath`: RustBuffer.ByValue,`nameFilter`: RustBuffer.ByValue,`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    fun uniffi_oura_core_fn_func_export_database(`dbPath`: RustBuffer.ByValue,`outPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_oura_core_fn_func_hourly_hr_json(`dbPath`: RustBuffer.ByValue,`tzOffset`: Long,`days`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun uniffi_oura_core_fn_func_quick_summary_json(`dbPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -973,7 +1005,17 @@ internal interface UniffiLib : Library {
     ): Unit
     fun ffi_oura_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_oura_core_checksum_func_backup_database(
+    ): Short
     fun uniffi_oura_core_checksum_func_core_version(
+    ): Short
+    fun uniffi_oura_core_checksum_func_database_integrity(
+    ): Short
+    fun uniffi_oura_core_checksum_func_events_json(
+    ): Short
+    fun uniffi_oura_core_checksum_func_export_database(
+    ): Short
+    fun uniffi_oura_core_checksum_func_hourly_hr_json(
     ): Short
     fun uniffi_oura_core_checksum_func_quick_summary_json(
     ): Short
@@ -981,7 +1023,13 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_oura_core_checksum_func_summary_json(
     ): Short
+    fun uniffi_oura_core_checksum_method_ringsession_cancel(
+    ): Short
+    fun uniffi_oura_core_checksum_method_ringsession_factory_reset(
+    ): Short
     fun uniffi_oura_core_checksum_method_ringsession_live_heart_rate(
+    ): Short
+    fun uniffi_oura_core_checksum_method_ringsession_pair(
     ): Short
     fun uniffi_oura_core_checksum_method_ringsession_push_frame(
     ): Short
@@ -1016,10 +1064,25 @@ private fun uniffiCheckContractApiVersion(lib: UniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: UniffiLib) {
+    if (lib.uniffi_oura_core_checksum_func_backup_database() != 40677.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_oura_core_checksum_func_core_version() != 24695.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_oura_core_checksum_func_quick_summary_json() != 19199.toShort()) {
+    if (lib.uniffi_oura_core_checksum_func_database_integrity() != 19533.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_func_events_json() != 22398.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_func_export_database() != 30024.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_func_hourly_hr_json() != 21410.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_func_quick_summary_json() != 3685.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_oura_core_checksum_func_rmssd() != 51404.toShort()) {
@@ -1028,7 +1091,16 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_oura_core_checksum_func_summary_json() != 27782.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_oura_core_checksum_method_ringsession_cancel() != 11635.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_method_ringsession_factory_reset() != 9780.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_oura_core_checksum_method_ringsession_live_heart_rate() != 14542.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_method_ringsession_pair() != 40653.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557.toShort()) {
@@ -1191,6 +1263,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterULong: FfiConverter<ULong, Long> {
     override fun lift(value: Long): ULong {
         return value.toULong()
@@ -1254,6 +1349,29 @@ public object FfiConverterDouble: FfiConverter<Double, Double> {
 
     override fun write(value: Double, buf: ByteBuffer) {
         buf.putDouble(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
     }
 }
 
@@ -1502,6 +1620,27 @@ private class AndroidSystemCleanable(
 public interface RingSessionInterface {
     
     /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */
+    fun `cancel`(`reason`: kotlin.String)
+    
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+    suspend fun `factoryReset`(`keyHex`: kotlin.String, `confirmSerial`: kotlin.String): kotlin.String
+    
+    /**
      * Authenticate, switch the ring's daytime HR to live mode, and report each beat
      * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
      * (a battery backstop if the client never stops). The ring must be worn.
@@ -1511,6 +1650,21 @@ public interface RingSessionInterface {
      * drops the future, and with it the restore, leaving the ring in live mode.
      */
     suspend fun `liveHeartRate`(`keyHex`: kotlin.String, `maxSeconds`: kotlin.UInt, `listener`: HeartRateListener)
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+    suspend fun `pair`(`existingKeyHex`: kotlin.String?): PairReport
     
     /**
      * Swift pushes each inbound BLE notification frame here.
@@ -1629,6 +1783,55 @@ open class RingSession: Disposable, AutoCloseable, RingSessionInterface {
 
     
     /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */override fun `cancel`(`reason`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_cancel(
+        it, FfiConverterString.lower(`reason`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+    @Throws(SyncException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `factoryReset`(`keyHex`: kotlin.String, `confirmSerial`: kotlin.String) : kotlin.String {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_factory_reset(
+                thisPtr,
+                FfiConverterString.lower(`keyHex`),FfiConverterString.lower(`confirmSerial`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterString.lift(it) },
+        // Error FFI converter
+        SyncException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Authenticate, switch the ring's daytime HR to live mode, and report each beat
      * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
      * (a battery backstop if the client never stops). The ring must be worn.
@@ -1653,6 +1856,40 @@ open class RingSession: Disposable, AutoCloseable, RingSessionInterface {
         // lift function
         { Unit },
         
+        // Error FFI converter
+        SyncException.ErrorHandler,
+    )
+    }
+
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+    @Throws(SyncException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `pair`(`existingKeyHex`: kotlin.String?) : PairReport {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_pair(
+                thisPtr,
+                FfiConverterOptionalString.lower(`existingKeyHex`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterTypePairReport.lift(it) },
         // Error FFI converter
         SyncException.ErrorHandler,
     )
@@ -1753,6 +1990,53 @@ public object FfiConverterTypeRingSession: FfiConverter<RingSession, Pointer> {
 
 
 
+/**
+ * What a successful [`RingSession::pair`] installed.
+ *
+ * `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+ * reads it back, and losing it can only be undone by another factory reset. Persist
+ * it (Keychain) before doing anything else with this value.
+ */
+data class PairReport (
+    var `serial`: kotlin.String, 
+    var `keyHex`: kotlin.String, 
+    /**
+     * True when the key was freshly minted here, false when `existing_key_hex`
+     * re-installed a key the caller already held.
+     */
+    var `minted`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePairReport: FfiConverterRustBuffer<PairReport> {
+    override fun read(buf: ByteBuffer): PairReport {
+        return PairReport(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PairReport) = (
+            FfiConverterString.allocationSize(value.`serial`) +
+            FfiConverterString.allocationSize(value.`keyHex`) +
+            FfiConverterBoolean.allocationSize(value.`minted`)
+    )
+
+    override fun write(value: PairReport, buf: ByteBuffer) {
+            FfiConverterString.write(value.`serial`, buf)
+            FfiConverterString.write(value.`keyHex`, buf)
+            FfiConverterBoolean.write(value.`minted`, buf)
+    }
+}
+
+
+
 data class SyncReport (
     var `serial`: kotlin.String, 
     var `eventsSynced`: kotlin.UInt, 
@@ -1805,6 +2089,32 @@ sealed class SyncException: kotlin.Exception() {
             get() = "v1=${ v1 }"
     }
     
+    class Storage(
+        
+        val `operation`: kotlin.String, 
+        
+        val `code`: kotlin.Int, 
+        
+        val `extendedCode`: kotlin.Int, 
+        
+        val `detail`: kotlin.String, 
+        
+        val `retryable`: kotlin.Boolean, 
+        
+        val `checkpoint`: kotlin.UInt
+        ) : SyncException() {
+        override val message
+            get() = "operation=${ `operation` }, code=${ `code` }, extendedCode=${ `extendedCode` }, detail=${ `detail` }, retryable=${ `retryable` }, checkpoint=${ `checkpoint` }"
+    }
+    
+    class Interrupted(
+        
+        val `reason`: kotlin.String
+        ) : SyncException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+    
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<SyncException> {
         override fun lift(error_buf: RustBuffer.ByValue): SyncException = FfiConverterTypeSyncError.lift(error_buf)
@@ -1824,6 +2134,17 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             1 -> SyncException.Failed(
                 FfiConverterString.read(buf),
                 )
+            2 -> SyncException.Storage(
+                FfiConverterString.read(buf),
+                FfiConverterInt.read(buf),
+                FfiConverterInt.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterUInt.read(buf),
+                )
+            3 -> SyncException.Interrupted(
+                FfiConverterString.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -1835,6 +2156,21 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
                 4UL
                 + FfiConverterString.allocationSize(value.v1)
             )
+            is SyncException.Storage -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.`operation`)
+                + FfiConverterInt.allocationSize(value.`code`)
+                + FfiConverterInt.allocationSize(value.`extendedCode`)
+                + FfiConverterString.allocationSize(value.`detail`)
+                + FfiConverterBoolean.allocationSize(value.`retryable`)
+                + FfiConverterUInt.allocationSize(value.`checkpoint`)
+            )
+            is SyncException.Interrupted -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
         }
     }
 
@@ -1843,6 +2179,21 @@ public object FfiConverterTypeSyncError : FfiConverterRustBuffer<SyncException> 
             is SyncException.Failed -> {
                 buf.putInt(1)
                 FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is SyncException.Storage -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`operation`, buf)
+                FfiConverterInt.write(value.`code`, buf)
+                FfiConverterInt.write(value.`extendedCode`, buf)
+                FfiConverterString.write(value.`detail`, buf)
+                FfiConverterBoolean.write(value.`retryable`, buf)
+                FfiConverterUInt.write(value.`checkpoint`, buf)
+                Unit
+            }
+            is SyncException.Interrupted -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2079,6 +2430,38 @@ public object FfiConverterTypeSyncProgressListener: FfiConverterCallbackInterfac
 /**
  * @suppress
  */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUShort: FfiConverterRustBuffer<List<kotlin.UShort>> {
     override fun read(buf: ByteBuffer): List<kotlin.UShort> {
         val len = buf.getInt()
@@ -2109,6 +2492,28 @@ public object FfiConverterSequenceUShort: FfiConverterRustBuffer<List<kotlin.USh
 
 
         /**
+         * Write a clean single-file copy of the database to `dest_path` — the export half of
+         * backup/restore.
+         *
+         * Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+         * own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+         * log in and produces one consistent, defragmented file. It reads the source without
+         * modifying it, so it is safe while the app is otherwise idle.
+         *
+         * The result carries ring data only. The auth key lives in the Keychain and is NOT in
+         * here — restoring onto a fresh phone still needs the key entered separately.
+         */
+    @Throws(SyncException::class) fun `backupDatabase`(`dbPath`: kotlin.String, `destPath`: kotlin.String): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_func_backup_database(
+        FfiConverterString.lower(`dbPath`),FfiConverterString.lower(`destPath`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Build/version string — a trivial call to validate the FFI round-trip.
          */ fun `coreVersion`(): kotlin.String {
             return FfiConverterString.lift(
@@ -2120,9 +2525,80 @@ public object FfiConverterSequenceUShort: FfiConverterRustBuffer<List<kotlin.USh
     }
     
 
+    @Throws(SyncException::class) fun `databaseIntegrity`(`dbPath`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_func_database_integrity(
+        FfiConverterString.lower(`dbPath`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Every decoded event the ring has sent, newest first — the raw-data browser and
+         * the debug charts behind it.
+         *
+         * `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+         * empty means all. `limit` caps the rows returned — the table reaches six figures on
+         * a real ring, so the UI pages rather than loading everything.
+         *
+         * Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+         * summary uses, so points land on the right day even across a ring reboot; the raw
+         * `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+         * when that resolution is itself what you're debugging. `decoded` is the decoder's own
+         * JSON object, so a chart can plot any numeric field in it without the FFI knowing
+         * what the field means.
+         *
+         * Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+         */ fun `eventsJson`(`dbPath`: kotlin.String, `nameFilter`: kotlin.String, `limit`: kotlin.UInt): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_func_events_json(
+        FfiConverterString.lower(`dbPath`),FfiConverterString.lower(`nameFilter`),FfiConverterUInt.lower(`limit`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Copy the synced database to `out_path` as one self-contained SQLite file
+         * (SQLite page backup), so the exact on-phone ring records can be replayed on the
+         * desktop with `oura --db <file> …`. The auth key lives in the Keychain and is
+         * never part of the database.
+         */
+    @Throws(SyncException::class) fun `exportDatabase`(`dbPath`: kotlin.String, `outPath`: kotlin.String)
+        = 
+    uniffiRustCallWithError(SyncException) { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_func_export_database(
+        FfiConverterString.lower(`dbPath`),FfiConverterString.lower(`outPath`),_status)
+}
+    
+    
+
+        /**
+         * Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+         * hour, `{low, high, mean, count}`, plus the newest quality-gated
+         * reading as `latest`.
+         *
+         * The nightly RHR trend answers "how have I been sleeping"; this answers "what did
+         * my heart do today". `tz_offset` is whole hours from UTC (same as [`summary_json`]),
+         * `days` caps the window to that many days back from the newest sample (0 = all).
+         *
+         * Returns the JSON string, or `{ "error": "…" }`.
+         */ fun `hourlyHrJson`(`dbPath`: kotlin.String, `tzOffset`: kotlin.Long, `days`: kotlin.UInt): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_func_hourly_hr_json(
+        FfiConverterString.lower(`dbPath`),FfiConverterLong.lower(`tzOffset`),FfiConverterUInt.lower(`days`),_status)
+}
+    )
+    }
+    
+
         /**
          * A lightweight, model-free summary (device + data-health only) — kept as a fast
-         * path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
+         * path / fallback. Returns `{ serials, device, event_counts, total_events, raw_events, decoded_events }`.
          */ fun `quickSummaryJson`(`dbPath`: kotlin.String): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->

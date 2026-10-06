@@ -431,6 +431,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -473,6 +489,30 @@ fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
 
     public static func write(_ value: Double, into buf: inout [UInt8]) {
         writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -545,9 +585,61 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol RingSessionProtocol : AnyObject {
     
     /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */
+    func cancel(reason: String) 
+    
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+    func factoryReset(keyHex: String, confirmSerial: String) async throws  -> String
+    
+    /**
+     * Authenticate, switch the ring's daytime HR to live mode, and report each beat
+     * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
+     * (a battery backstop if the client never stops). The ring must be worn.
+     *
+     * Always restores the feature to AUTOMATIC before returning. Callers should stop
+     * via `stop_live_heart_rate` and await this call rather than cancel it: cancelling
+     * drops the future, and with it the restore, leaving the ring in live mode.
+     */
+    func liveHeartRate(keyHex: String, maxSeconds: UInt32, listener: HeartRateListener) async throws 
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+    func pair(existingKeyHex: String?) async throws  -> PairReport
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
     func pushFrame(data: Data) 
+    
+    /**
+     * End a running `live_heart_rate` call; it restores the ring and returns.
+     */
+    func stopLiveHeartRate() 
     
     /**
      * Authenticate, set up the app stream, and drain history events into the DB at
@@ -624,11 +716,117 @@ public convenience init(writer: BleWriter) {
 
     
     /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */
+open func cancel(reason: String) {try! rustCall() {
+    uniffi_oura_core_fn_method_ringsession_cancel(self.uniffiClonePointer(),
+        FfiConverterString.lower(reason),$0
+    )
+}
+}
+    
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+open func factoryReset(keyHex: String, confirmSerial: String)async throws  -> String {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_factory_reset(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyHex),FfiConverterString.lower(confirmSerial)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
+     * Authenticate, switch the ring's daytime HR to live mode, and report each beat
+     * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
+     * (a battery backstop if the client never stops). The ring must be worn.
+     *
+     * Always restores the feature to AUTOMATIC before returning. Callers should stop
+     * via `stop_live_heart_rate` and await this call rather than cancel it: cancelling
+     * drops the future, and with it the restore, leaving the ring in live mode.
+     */
+open func liveHeartRate(keyHex: String, maxSeconds: UInt32, listener: HeartRateListener)async throws  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_live_heart_rate(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyHex),FfiConverterUInt32.lower(maxSeconds),FfiConverterCallbackInterfaceHeartRateListener.lower(listener)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_void,
+            completeFunc: ffi_oura_core_rust_future_complete_void,
+            freeFunc: ffi_oura_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+open func pair(existingKeyHex: String?)async throws  -> PairReport {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_pair(
+                    self.uniffiClonePointer(),
+                    FfiConverterOptionString.lower(existingKeyHex)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePairReport.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
 open func pushFrame(data: Data) {try! rustCall() {
     uniffi_oura_core_fn_method_ringsession_push_frame(self.uniffiClonePointer(),
         FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+    /**
+     * End a running `live_heart_rate` call; it restores the ring and returns.
+     */
+open func stopLiveHeartRate() {try! rustCall() {
+    uniffi_oura_core_fn_method_ringsession_stop_live_heart_rate(self.uniffiClonePointer(),$0
     )
 }
 }
@@ -710,6 +908,95 @@ public func FfiConverterTypeRingSession_lift(_ pointer: UnsafeMutableRawPointer)
 #endif
 public func FfiConverterTypeRingSession_lower(_ value: RingSession) -> UnsafeMutableRawPointer {
     return FfiConverterTypeRingSession.lower(value)
+}
+
+
+/**
+ * What a successful [`RingSession::pair`] installed.
+ *
+ * `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+ * reads it back, and losing it can only be undone by another factory reset. Persist
+ * it (Keychain) before doing anything else with this value.
+ */
+public struct PairReport {
+    public var serial: String
+    public var keyHex: String
+    /**
+     * True when the key was freshly minted here, false when `existing_key_hex`
+     * re-installed a key the caller already held.
+     */
+    public var minted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(serial: String, keyHex: String, 
+        /**
+         * True when the key was freshly minted here, false when `existing_key_hex`
+         * re-installed a key the caller already held.
+         */minted: Bool) {
+        self.serial = serial
+        self.keyHex = keyHex
+        self.minted = minted
+    }
+}
+
+
+
+extension PairReport: Equatable, Hashable {
+    public static func ==(lhs: PairReport, rhs: PairReport) -> Bool {
+        if lhs.serial != rhs.serial {
+            return false
+        }
+        if lhs.keyHex != rhs.keyHex {
+            return false
+        }
+        if lhs.minted != rhs.minted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(serial)
+        hasher.combine(keyHex)
+        hasher.combine(minted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePairReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PairReport {
+        return
+            try PairReport(
+                serial: FfiConverterString.read(from: &buf), 
+                keyHex: FfiConverterString.read(from: &buf), 
+                minted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PairReport, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.serial, into: &buf)
+        FfiConverterString.write(value.keyHex, into: &buf)
+        FfiConverterBool.write(value.minted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lift(_ buf: RustBuffer) throws -> PairReport {
+    return try FfiConverterTypePairReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lower(_ value: PairReport) -> RustBuffer {
+    return FfiConverterTypePairReport.lower(value)
 }
 
 
@@ -801,6 +1088,10 @@ public enum SyncError {
     
     case Failed(String
     )
+    case Storage(operation: String, code: Int32, extendedCode: Int32, detail: String, retryable: Bool, checkpoint: UInt32
+    )
+    case Interrupted(reason: String
+    )
 }
 
 
@@ -820,6 +1111,17 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
         case 1: return .Failed(
             try FfiConverterString.read(from: &buf)
             )
+        case 2: return .Storage(
+            operation: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterInt32.read(from: &buf), 
+            extendedCode: try FfiConverterInt32.read(from: &buf), 
+            detail: try FfiConverterString.read(from: &buf), 
+            retryable: try FfiConverterBool.read(from: &buf), 
+            checkpoint: try FfiConverterUInt32.read(from: &buf)
+            )
+        case 3: return .Interrupted(
+            reason: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -835,6 +1137,21 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
         case let .Failed(v1):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .Storage(operation,code,extendedCode,detail,retryable,checkpoint):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(operation, into: &buf)
+            FfiConverterInt32.write(code, into: &buf)
+            FfiConverterInt32.write(extendedCode, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
+            FfiConverterBool.write(retryable, into: &buf)
+            FfiConverterUInt32.write(checkpoint, into: &buf)
+            
+        
+        case let .Interrupted(reason):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
             
         }
     }
@@ -926,6 +1243,138 @@ fileprivate struct FfiConverterCallbackInterfaceBleWriter {
 #endif
 extension FfiConverterCallbackInterfaceBleWriter : FfiConverter {
     typealias SwiftType = BleWriter
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+
+
+/**
+ * The client implements this to receive a live heart-rate stream. `on_status` gets
+ * the same short stage tags as sync ("auth" / "setup") plus "live" once the ring
+ * has been switched to live mode; `on_sample` gets each valid beat.
+ */
+public protocol HeartRateListener : AnyObject {
+    
+    func onStatus(stage: String) 
+    
+    func onSample(bpm: UInt16, ibiMs: UInt16) 
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceHeartRateListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    static var vtable: UniffiVTableCallbackInterfaceHeartRateListener = UniffiVTableCallbackInterfaceHeartRateListener(
+        onStatus: { (
+            uniffiHandle: UInt64,
+            stage: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceHeartRateListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onStatus(
+                     stage: try FfiConverterString.lift(stage)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onSample: { (
+            uniffiHandle: UInt64,
+            bpm: UInt16,
+            ibiMs: UInt16,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceHeartRateListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onSample(
+                     bpm: try FfiConverterUInt16.lift(bpm),
+                     ibiMs: try FfiConverterUInt16.lift(ibiMs)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            let result = try? FfiConverterCallbackInterfaceHeartRateListener.handleMap.remove(handle: uniffiHandle)
+            if result == nil {
+                print("Uniffi callback interface HeartRateListener: handle missing in uniffiFree")
+            }
+        }
+    )
+}
+
+private func uniffiCallbackInitHeartRateListener() {
+    uniffi_oura_core_fn_init_callback_vtable_heartratelistener(&UniffiCallbackInterfaceHeartRateListener.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceHeartRateListener {
+    fileprivate static var handleMap = UniffiHandleMap<HeartRateListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceHeartRateListener : FfiConverter {
+    typealias SwiftType = HeartRateListener
     typealias FfiType = UInt64
 
 #if swift(>=5.8)
@@ -1070,6 +1519,30 @@ extension FfiConverterCallbackInterfaceSyncProgressListener : FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt16: FfiConverterRustBuffer {
     typealias SwiftType = [UInt16]
 
@@ -1138,6 +1611,26 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     }
 }
 /**
+ * Write a clean single-file copy of the database to `dest_path` — the export half of
+ * backup/restore.
+ *
+ * Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+ * own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+ * log in and produces one consistent, defragmented file. It reads the source without
+ * modifying it, so it is safe while the app is otherwise idle.
+ *
+ * The result carries ring data only. The auth key lives in the Keychain and is NOT in
+ * here — restoring onto a fresh phone still needs the key entered separately.
+ */
+public func backupDatabase(dbPath: String, destPath: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_backup_database(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(destPath),$0
+    )
+})
+}
+/**
  * Build/version string — a trivial call to validate the FFI round-trip.
  */
 public func coreVersion() -> String {
@@ -1146,9 +1639,75 @@ public func coreVersion() -> String {
     )
 })
 }
+public func databaseIntegrity(dbPath: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_database_integrity(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
+ * Every decoded event the ring has sent, newest first — the raw-data browser and
+ * the debug charts behind it.
+ *
+ * `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+ * empty means all. `limit` caps the rows returned — the table reaches six figures on
+ * a real ring, so the UI pages rather than loading everything.
+ *
+ * Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+ * summary uses, so points land on the right day even across a ring reboot; the raw
+ * `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+ * when that resolution is itself what you're debugging. `decoded` is the decoder's own
+ * JSON object, so a chart can plot any numeric field in it without the FFI knowing
+ * what the field means.
+ *
+ * Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+ */
+public func eventsJson(dbPath: String, nameFilter: String, limit: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_events_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(nameFilter),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+/**
+ * Copy the synced database to `out_path` as one self-contained SQLite file
+ * (SQLite page backup), so the exact on-phone ring records can be replayed on the
+ * desktop with `oura --db <file> …`. The auth key lives in the Keychain and is
+ * never part of the database.
+ */
+public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_export_database(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(outPath),$0
+    )
+}
+}
+/**
+ * Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+ * hour, `{low, high, mean, count}`, plus the newest quality-gated
+ * reading as `latest`.
+ *
+ * The nightly RHR trend answers "how have I been sleeping"; this answers "what did
+ * my heart do today". `tz_offset` is whole hours from UTC (same as [`summary_json`]),
+ * `days` caps the window to that many days back from the newest sample (0 = all).
+ *
+ * Returns the JSON string, or `{ "error": "…" }`.
+ */
+public func hourlyHrJson(dbPath: String, tzOffset: Int64, days: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_hourly_hr_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterInt64.lower(tzOffset),
+        FfiConverterUInt32.lower(days),$0
+    )
+})
+}
 /**
  * A lightweight, model-free summary (device + data-health only) — kept as a fast
- * path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
+ * path / fallback. Returns `{ serials, device, event_counts, total_events, raw_events, decoded_events }`.
  */
 public func quickSummaryJson(dbPath: String) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -1204,10 +1763,25 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_oura_core_checksum_func_backup_database() != 40677) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_core_version() != 24695) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {
+    if (uniffi_oura_core_checksum_func_database_integrity() != 19533) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_events_json() != 22398) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_export_database() != 30024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_hourly_hr_json() != 21410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_quick_summary_json() != 3685) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_rmssd() != 51404) {
@@ -1216,7 +1790,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_oura_core_checksum_func_summary_json() != 27782) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_oura_core_checksum_method_ringsession_cancel() != 11635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_factory_reset() != 9780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_live_heart_rate() != 14542) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_pair() != 40653) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_stop_live_heart_rate() != 49649) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_sync() != 10321) {
@@ -1228,11 +1817,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_oura_core_checksum_method_blewriter_write() != 56807) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_oura_core_checksum_method_heartratelistener_on_status() != 65033) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_heartratelistener_on_sample() != 25848) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_method_syncprogresslistener_on_progress() != 32063) {
         return InitializationResult.apiChecksumMismatch
     }
 
     uniffiCallbackInitBleWriter()
+    uniffiCallbackInitHeartRateListener()
     uniffiCallbackInitSyncProgressListener()
     return InitializationResult.ok
 }()

@@ -10,17 +10,21 @@ signing requires *your* Apple Developer account.
 - Install xcodegen: `brew install xcodegen`.
 
 ## Build & upload
-Current upload version is configured as **0.1.1 (22)** in
+Current upload version is configured as **0.1.1 (39)** in
 `OuraApp/project.yml` and `OuraApp/project-ci.yml`.
 
 ```bash
 # 1. shared Rust core → both device + simulator slices
 ./apps/ios/build-xcframework.sh
 
-# 2. generate the Xcode project from project.yml
+# 2. rebuild the activity model's mobile export (requires Python with torch 2.9)
+#    fixes sparse-day peak detection; .pt/.ptl files are local, gitignored inputs
+python tools/export_mobile.py automatic_activity_detection_3_1_11
+
+# 3. generate the Xcode project from project.yml
 cd apps/ios/OuraApp && xcodegen generate
 
-# 3. open it, set your Team under Signing & Capabilities (or DEVELOPMENT_TEAM in project.yml)
+# 4. open it, set your Team under Signing & Capabilities (or DEVELOPMENT_TEAM in project.yml)
 open OuraApp.xcodeproj
 #    then: Product → Archive → Distribute App → TestFlight & App Store
 ```
@@ -31,6 +35,29 @@ xcodebuild -project OuraApp.xcodeproj -scheme OuraApp -sdk iphoneos \
 xcodebuild -exportArchive -archivePath build/OuraApp.xcarchive \
   -exportOptionsPlist ExportOptions.plist -exportPath build/export   # then upload with `xcrun altool`/Transporter
 ```
+
+## Reproducing a phone's analysis on a computer
+
+In the app: Sync → Help & diagnostics → **Export raw ring data**, then AirDrop/save the
+`oura-ring-<date>.db` file. It is a self-contained SQLite copy of the phone's store (no auth
+key). On the desktop it is a normal `--db` input:
+
+```bash
+./target/debug/oura --db ~/Downloads/oura-ring-20260911-0930.db dashboard --port 8099 --tz-offset 2
+curl -s localhost:8099/api/summary | python3 -c 'import json,sys; s=json.load(sys.stdin); print(json.dumps(s["clock"], indent=1)); [print(n["ymd"], n["wake_ymd"], n["start"], n["end"], n["clock_source"]) for n in s["nights"][:5]]'
+```
+
+The `clock` block (per-boot ds range, sync window, anchors) and each night's `clock_source`
+say whether a misdated night is a clock-anchoring problem or an analysis problem.
+
+## Activity model regression checks
+
+After changing the activity export, run `python -m unittest discover -s tools -p
+test_mobile_activity.py` from the repository root. This checks sparse-day behavior
+and exact full-model output parity through an export/reload. The TORCH-enabled
+`StabilityTests` also exercise sparse days and a known workout in the iOS lite
+runtime. Re-export before archiving: updating Swift alone does not replace an
+older local `.ptl` file.
 
 ## Already handled
 - App icon (`Assets.xcassets/AppIcon.appiconset`, 1024²).

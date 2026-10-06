@@ -27,13 +27,27 @@ struct NightSeries: Codable {
     var hrv: [Double] = []
     var spo2: [Double] = []
     var temp: [Double] = []
+    var motion_time: [Double]? = nil
     var temp_span: [Double]? = nil
     var motion: [Double] = []
+}
+// Timestamped `[unix_s, value]` pairs per signal from `build_summary` (`series_t`).
+struct NightTimedSeries: Codable {
+    var hr: [[Double]] = []
+    var hrv: [[Double]] = []
+    var spo2: [[Double]] = []
+    var temp: [[Double]] = []
+    var motion: [[Double]] = []
 }
 struct NightRow: Codable, Identifiable {
     var date: String?; var ymd: String?; var start_ds: Int64?; var end_ds: Int64?
     var raw_start_ds: Int64?; var raw_end_ds: Int64?; var bedtime_adjusted: Bool?
+    var bedtime_manual: Bool?
+    var raw_start: String?; var raw_end: String?
     var start: String?; var end: String?
+    // supplied by the shared brain: the morning you woke (day the night belongs to),
+    // absolute bounds, and how the ring clock was tied to wall time for this night.
+    var wake_ymd: String?; var start_unix: Int64?; var end_unix: Int64?; var clock_source: String?
     var in_bed_h: Double?; var hrv_ms: Double?; var rhr: Double?
     var skin_temp: Double?; var spo2_mean: Double?
     // model-derived (present once the hypnogram runner is wired): per-30s stage codes
@@ -41,10 +55,99 @@ struct NightRow: Codable, Identifiable {
     var deep_pct: Double?; var light_pct: Double?; var rem_pct: Double?
     var wake_pct: Double?; var efficiency: Double?
     var stages: [Int]? = nil
+    var stages_full: [Int]? = nil
+    var staging_source: String? = nil
+    var staging_coverage_pct: Double? = nil
+    var staging_complete: Bool? = nil
+    var captured_unix: Int64? = nil
+    var stagingKey: String { "\(start_ds ?? 0):\(start_unix ?? captured_unix ?? 0)" }
+    var hypnogram: [Int]? { stages_full ?? stages }
+    var stagingComplete: Bool { staging_complete ?? (hypnogram?.allSatisfy { (1...4).contains($0) } ?? false) }
+    var durationS: Double {
+        if let start_unix, let end_unix { return Double(end_unix - start_unix) }
+        return (in_bed_h ?? 0) * 3600
+    }
     var series: NightSeries? = nil
+    var series_t: NightTimedSeries? = nil
+    var autonomic: StageAutonomic? = nil
+    /// Nightly respiratory rate (breaths/min), the ring's own per-window estimate.
+    var breath_rate: Double? = nil
+    var sleep_score: SleepScore? = nil
     var id: String { (date ?? "") + (start ?? "") }
-    var hasHypnogram: Bool { (stages?.count ?? 0) > 1 }
+    var hasHypnogram: Bool { (hypnogram?.count ?? 0) > 1 }
+    var isBedtimeManual: Bool { bedtime_manual ?? false }
+    var hasSignals: Bool {
+        !(series_t?.hr.isEmpty ?? true) || !(series?.hr.isEmpty ?? true)
+            || !(series_t?.motion.isEmpty ?? true) || !(series?.motion.isEmpty ?? true)
+    }
 }
+/// One component of the literature-based sleep score, with the paper behind it.
+struct SleepScoreComponent: Codable, Identifiable {
+    var key: String
+    var score: Double
+    var weight: Double
+    var detail: [String: JSONValue]?
+    var id: String { key }
+    var label: String {
+        switch key {
+        case "duration": return "duration"
+        case "efficiency": return "efficiency"
+        case "onset_latency": return "time to fall asleep"
+        case "waso": return "awake during the night"
+        case "awakenings": return "awakenings"
+        case "architecture": return "stage balance"
+        case "physiology": return "heart & HRV"
+        default: return key
+        }
+    }
+    var source: String? {
+        if case .string(let text)? = detail?["source"] { return text }
+        return nil
+    }
+}
+
+/// A sleep score computed from published norms rather than from Oura's model — every
+/// threshold in it traces to a paper. See `oura-summary/src/sleep_score.rs`.
+struct SleepScore: Codable {
+    var score: Double
+    var components: [SleepScoreComponent] = []
+    var basis: String?
+}
+
+/// Minimal JSON value, so a component's `detail` can be carried through and read
+/// without the app needing to know every key the Rust side might add.
+enum JSONValue: Codable {
+    case string(String), number(Double), bool(Bool), array([JSONValue]), null
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let v = try? c.decode(Bool.self) { self = .bool(v) }
+        else if let v = try? c.decode(Double.self) { self = .number(v) }
+        else if let v = try? c.decode(String.self) { self = .string(v) }
+        else if let v = try? c.decode([JSONValue].self) { self = .array(v) }
+        else { self = .null }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let v): try c.encode(v)
+        case .number(let v): try c.encode(v)
+        case .bool(let v): try c.encode(v)
+        case .array(let v): try c.encode(v)
+        case .null: try c.encodeNil()
+        }
+    }
+    var text: String {
+        switch self {
+        case .string(let v): return v
+        case .number(let v): return v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v)
+        case .bool(let v): return v ? "yes" : "no"
+        case .array(let v): return v.map(\.text).joined(separator: "–")
+        case .null: return "—"
+        }
+    }
+}
+
 struct DailyStat: Codable { var active_kcal: Double?; var total_kcal: Double?; var steps: Double?; var distance_m: Double? }
 struct Profile: Codable { var sex: String?; var age: Double?; var height_m: Double?; var weight_kg: Double?; var ring_size: Double? }
 // a detected activity session (on-device automatic_activity_detection)
@@ -78,12 +181,15 @@ struct SleepDebtSummary: Codable {
 struct Device: Codable {
     var serial: String?; var firmware: String?
     var battery_pct: Int?
-    var days_of_data: Double?; var nights: Int?
+    var days_of_data: Double?; var elapsed_days: Double?
+    var observed_days: Int?; var observed_coverage_days: Double?
+    var nights: Int?
+    var total_events: Int?; var raw_events: Int?; var decoded_events: Int?
     var synced: String?; var synced_hm: String?
 }
 // Symptom Radar (on-device illness detection). Mirrors the web summary's `illness`
 // block; computed on-device by IllnessModel so it isn't part of the FFI JSON.
-struct IllnessBiomarker: Identifiable {
+struct IllnessBiomarker: Identifiable, Codable {
     let type: String        // AverageBreath | LowestHeartRate | AverageHrv | TemperatureDeviation
     let value: Double
     let lower: Double
@@ -92,7 +198,7 @@ struct IllnessBiomarker: Identifiable {
     let reason: String?     // "ELEVATED" | "DECREASED" | nil
     var id: String { type }
 }
-struct IllnessResult {
+struct IllnessResult: Codable {
     var available: Bool
     var status: String          // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS | MISSING_LAST_NIGHT_SLEEP | MISSING_SLEEP_DATA
     var trafficLight: String     // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS
@@ -103,10 +209,30 @@ struct IllnessResult {
     var biomarkers: [IllnessBiomarker]
 }
 
+/// Per-boot ring clock diagnostics from the shared brain (`clock` in the summary JSON).
+struct ClockEpoch: Codable {
+    var min_ds: Int64?; var max_ds: Int64?; var span_h: Double?
+    var capture_min: Int64?; var capture_max: Int64?
+    var anchors: Int?; var anchor_sources: [String]?; var latest_anchor_unix: Int64?
+}
+struct ClockDiag: Codable {
+    var epochs: [ClockEpoch] = []
+    var warnings: [String] = []
+    var undated_reasons: [String: Int]? = nil
+    var undated_nights: [UndatedNight] = []
+}
+struct UndatedNight: Codable {
+    var start_ds: Int64?; var end_ds: Int64?; var in_bed_h: Double?
+    var captured_unix: Int64?; var source: String?
+    var reason: String?; var recoverable: Bool?
+}
 struct Summary: Codable {
+    var analysis_digest: String? = nil
+    var analysis_version: Int? = nil
     var digest: String?
     var device: Device?
     var nights: [NightRow] = []
+    var clock: ClockDiag?
     var vitals = Vitals()
     var activity_profile: [String: [Double]] = [:]   // date → 96 × 15-min mean MET-above-rest
     var activity_daily: [String: DailyStat] = [:]     // date → steps / active-kcal / total-kcal
@@ -114,27 +240,64 @@ struct Summary: Codable {
     var cardio: Cardio?
     var fitness: Fitness?
     var sleepDebt: SleepDebtSummary?
-    var illness: IllnessResult?           // on-device only (Symptom Radar; not in the JSON)
+    var illness: IllnessResult?           // on-device only (torch Symptom Radar; not in the JSON)
+    /// Model-free Symptom Radar from the shared core — same biomarkers, same shape,
+    /// judged against your own baseline. Used when the torch model is not present.
+    var symptoms: IllnessResult?
     var workouts: [WorkoutSession] = []   // on-device only (not in the JSON)
     var modelErrors: [String] = []        // on-device model failures (not in the JSON)
     var error: String?
     // `workouts`/`modelErrors` are filled on-device (not in the FFI JSON), so keep them
     // out of decoding.
     enum CodingKeys: String, CodingKey {
-        case digest, device, nights, vitals, activity_profile, activity_daily, profile, cardio, fitness, error
+        case analysis_digest, analysis_version
+        case digest, device, nights, clock, vitals, activity_profile, activity_daily, profile, cardio, fitness, error
+        case symptoms
         case sleepDebt = "sleep_debt"
+    }
+    init() {}
+    init(nights: [NightRow]) { self.nights = nights }
+    init(error: String) { self.error = error }
+    /// Every key is optional so the core's `{"error": "…"}` payload decodes into a
+    /// Summary that carries the message instead of a generic "decode failed".
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        analysis_digest = try c.decodeIfPresent(String.self, forKey: .analysis_digest)
+        analysis_version = try c.decodeIfPresent(Int.self, forKey: .analysis_version)
+        digest = try c.decodeIfPresent(String.self, forKey: .digest)
+        device = try c.decodeIfPresent(Device.self, forKey: .device)
+        nights = try c.decodeIfPresent([NightRow].self, forKey: .nights) ?? []
+        clock = try c.decodeIfPresent(ClockDiag.self, forKey: .clock)
+        vitals = try c.decodeIfPresent(Vitals.self, forKey: .vitals) ?? Vitals()
+        activity_profile = try c.decodeIfPresent([String: [Double]].self, forKey: .activity_profile) ?? [:]
+        activity_daily = try c.decodeIfPresent([String: DailyStat].self, forKey: .activity_daily) ?? [:]
+        profile = try c.decodeIfPresent(Profile.self, forKey: .profile)
+        cardio = try c.decodeIfPresent(Cardio.self, forKey: .cardio)
+        fitness = try c.decodeIfPresent(Fitness.self, forKey: .fitness)
+        sleepDebt = try c.decodeIfPresent(SleepDebtSummary.self, forKey: .sleepDebt)
+        symptoms = try c.decodeIfPresent(IllnessResult.self, forKey: .symptoms)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
     }
     /// recent days (newest first) that have a movement profile.
     var activeDays: [String] { activity_profile.keys.sorted(by: >) }
 }
 
 extension Summary {
+    /// Whichever Symptom Radar this build has: the on-device torch model when the
+    /// `.ptl` is bundled, the shared core's baseline comparison otherwise.
+    var symptomRadar: IllnessResult? {
+        if let illness, illness.available { return illness }
+        return symptoms
+    }
+
     // The calendar date you WOKE from a night. Nights are labelled by onset date (the
     // evening you went to bed), so an overnight sleep crossing midnight belongs to the
     // next day's morning. Pairing a day with the sleep you woke from — not the sleep you
     // started that evening — is what makes "night + activity of the day" one coherent
     // day. Kept identical to the web dashboard's wakeYmd().
     func wakeYmd(_ n: NightRow) -> String? {
+        if let wake = n.wake_ymd { return wake }
+        // Older cached summaries predate `wake_ymd`: infer it from the clock strings.
         guard let ymd = n.ymd else { return nil }
         guard let s = n.start, let e = n.end, e < s else { return ymd }
         let p = ymd.split(separator: "-").compactMap { Int($0) }
@@ -210,7 +373,7 @@ enum VitalKind: String, Identifiable, CaseIterable {
     var caption: String {
         switch self {
         case .hrv: return "RMSSD from the longest sleep of each morning"
-        case .heartRate: return "Nightly minimum resting heart rate"
+        case .heartRate: return "Hour by hour from the beats the ring recorded, plus the nightly minimum resting rate"
         case .temp: return "Nightly skin temperature"
         case .oxygen: return "Nightly average blood oxygen"
         }
@@ -355,3 +518,85 @@ private func clockLabel(_ hour: Double) -> String {
     let totalMinutes = Int((hour * 60).rounded())
     return String(format: "%02d:%02d", (totalMinutes / 60) % 24, totalMinutes % 60)
 }
+
+/// Persists manual bedtime and wake-up adjustments in `bedtime_overrides.json` beside
+/// `oura.db` so `oura-summary` (FFI) reads the exact same format on iOS and desktop.
+enum BedtimeOverrideStore {
+    struct Entry: Codable, Equatable {
+        var start_ds: Int64
+        var end_ds: Int64
+        var start: String? = nil
+        var end: String? = nil
+    }
+
+    static func fileURL(for dbPath: String? = nil) -> URL {
+        let path = dbPath ?? DB.readPath()
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+        return dir.appendingPathComponent("bedtime_overrides.json")
+    }
+
+    static func load(dbPath: String? = nil) -> [String: Entry] {
+        let url = fileURL(for: dbPath)
+        guard let data = try? Data(contentsOf: url),
+              let entries = try? JSONDecoder().decode([String: Entry].self, from: data) else {
+            return [:]
+        }
+        return entries
+    }
+
+    private static func write(_ map: [String: Entry], dbPath: String? = nil) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(map)
+        let primary = fileURL(for: dbPath)
+        try data.write(to: primary, options: .atomic)
+        if dbPath == nil {
+            let writable = DB.url.deletingLastPathComponent().appendingPathComponent("bedtime_overrides.json")
+            if writable != primary {
+                try? data.write(to: writable, options: .atomic)
+            }
+        }
+    }
+
+    private static func hmMinutes(_ hm: String?) -> Int {
+        let parts = (hm ?? "00:00").split(separator: ":").compactMap { Int($0) }
+        return (parts.first ?? 0) * 60 + (parts.count > 1 ? parts[1] : 0)
+    }
+
+    static func set(startHM: String, endHM: String, forNightKey key: String, night: NightRow? = nil, dbPath: String? = nil) throws {
+        var map = load(dbPath: dbPath)
+        let baseStartDs = night?.raw_start_ds ?? night?.start_ds ?? 10_000
+        let baseStartMin = hmMinutes(night?.raw_start ?? night?.start ?? "00:00")
+        let newStartMin = hmMinutes(startHM)
+        let newEndMin = hmMinutes(endHM)
+        var deltaStartMin = (newStartMin - baseStartMin) % 1440
+        if deltaStartMin > 720 { deltaStartMin -= 1440 }
+        if deltaStartMin < -720 { deltaStartMin += 1440 }
+        let spanMin = newEndMin > newStartMin ? (newEndMin - newStartMin) : (newEndMin + 1440 - newStartMin)
+        let startDs = baseStartDs + Int64(deltaStartMin) * 600
+        let endDs = startDs + Int64(max(30, min(1200, spanMin))) * 600
+        let entry = Entry(start_ds: startDs, end_ds: endDs, start: startHM, end: endHM)
+        map[key] = entry
+        if let rawStart = night?.raw_start_ds ?? night?.start_ds {
+            map["\(rawStart)"] = entry
+            if let cu = night?.captured_unix {
+                map["\(rawStart):\(cu)"] = entry
+            }
+        }
+        try write(map, dbPath: dbPath)
+    }
+
+    static func clear(forNightKey key: String, night: NightRow? = nil, dbPath: String? = nil) throws {
+        var map = load(dbPath: dbPath)
+        map.removeValue(forKey: key)
+        if let rawStart = night?.raw_start_ds ?? night?.start_ds {
+            map.removeValue(forKey: "\(rawStart)")
+            if let cu = night?.captured_unix {
+                map.removeValue(forKey: "\(rawStart):\(cu)")
+            }
+        }
+        try write(map, dbPath: dbPath)
+    }
+}
+
+

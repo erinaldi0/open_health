@@ -15,7 +15,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "22"
+    CURRENT_PROJECT_VERSION: "39"
     PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
@@ -42,8 +42,12 @@ targets:
       - path: OuraApp.swift
       - path: Models.swift
       - path: Core.swift
+      - path: WorkCoordinator.swift
       - path: Components.swift
       - path: Reports.swift
+      - path: DayExport.swift
+      - path: RawData.swift
+      - path: HeartRate.swift
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift
@@ -59,3 +63,22 @@ targets:
       - sdk: HealthKit.framework
       - framework: ../OuraCore.xcframework
         embed: false
+
+  OuraAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: OuraApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  OuraApp:
+    build:
+      targets:
+        OuraApp: all
+    test:
+      targets: [OuraAppTests]

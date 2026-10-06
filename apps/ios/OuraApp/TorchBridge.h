@@ -19,7 +19,7 @@ int oura_sleepnet(const char *model_path,
                   const int64_t *acm_ts, const float *acm_val, int n_acm,
                   const int64_t *temp_ts, const float *temp_val, int n_temp,
                   int64_t bedtime_start_ms, int64_t bedtime_end_ms,
-                  int *out_stages, int max_out);
+                  int *out_stages, int64_t *out_timestamps_ms, int max_out);
 
 // Cardiovascular age (cva_2_1_0): forward(ppg [n_segs×1500] f32, demo [1×5] f32) →
 // (vascular_age, …, pwv, …). `ppg` is row-major; `demo` is [sex(-1/0/1), height_m,
@@ -32,6 +32,9 @@ int oura_cva(const char *model_path, const float *ppg, int n_segs, const float *
 //   temp[n_temp×2], hr[n_hr×2], None, None, threshold, min_duration, 0.0). Writes
 // workouts row-major into out_workouts (max_rows × 9 =
 // [start_min, end_min, is_workout, id1,p1, id2,p2, id3,p3]); returns rows / -1.
+// Last activity/step-decoder error on this thread; copy before the next call.
+const char *oura_activity_last_error(void);
+
 int oura_activity(const char *model_path, const float *context, const float *user,
                   const float *met, int n_met, const float *step, int n_step,
                   const float *motion, int n_motion,
@@ -56,6 +59,9 @@ int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
 // out_biomarkers (16 floats). Returns 0 / -1.
 int oura_illness(const char *model_path, const float *series, const float *scalars,
                  double *out_score, int *out_decision, float *out_biomarkers);
+// Free every loaded model module (they reload on next use). Waits for a running
+// inference to finish, so call it off the main thread.
+void oura_torch_release(void);
 #ifdef __cplusplus
 }
 #endif

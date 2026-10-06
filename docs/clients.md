@@ -1,6 +1,6 @@
 # Three clients, one core — keep them in sync
 
-open_oura has **three user-facing clients that render the same health data**. When you
+open_health has **three user-facing clients that render the same health data**. When you
 add or change a feature, you almost always have to touch **all of them**. This is the map.
 
 | | Web dashboard | Native iOS app | Native Android app |
@@ -47,11 +47,13 @@ metric there once and both clients receive it in the JSON.
 | Digest headline | `load()` digest | `RootView` digest | `RootScreen` digest | `digest` | — |
 | Vitals (HRV/RHR/temp/SpO₂) | `renderTiles` / `VitalCell`-like | `VitalCell` | `VitalCell` (Atoms.kt) | `vitals`, `nights[]` | — |
 | **Unified day (night + activity)** | `renderDay`, `dayCard` | `TodayCard` | `TodayCard` | `nights[]`, `activity*` | — |
-| **Full-page sleep report** (polysomnograph + clinical metrics + interpretation) | `openDayPage`→`sleepReport`, `polysomnograph`, `hypnoSvg` | `DayReportView`→`SleepReport`, `Polysomnograph` (Reports.swift) | `DayReportScreen`→`SleepReport`, `Polysomnograph` (Reports.kt) | `nights[].{stages_full,series,metrics}` | SleepNet |
+| **Full-page sleep report** (polysomnograph + clinical metrics + interpretation) | `openDayPage`→`sleepSection` (`tlBox` lanes from `nights[].series_t`, `hypnoSvg`) | `DayReportView`→`SleepReport`, `Polysomnograph` (Reports.swift) | `DayReportScreen`→`SleepReport`, `Polysomnograph` (Reports.kt) | `nights[].{stages_full,series,metrics}` | SleepNet |
 | **Sleep debt** (14-day card + cumulative debt / total sleep detail) | `renderSleepDebt`→`openSleepDebt` | `SleepDebtCard`→`SleepDebtDetail` | `SleepDebtCard`→`SleepDebtDetail` | `sleep_debt`, grouped by wake date including naps | SleepNet |
-| **Full-page activity report** (24h MET profile + intensity metrics) | `openDayPage`→`activityReport`, `metProfileSvg` | `DayReportView`→`ActivityReport`, `MetProfile` (Reports.swift) | `DayReportScreen`→`ActivityReport`, `MetProfile` (Reports.kt) | `activity_profile`, `activity_daily`, `activity` | AAD |
+| **Day JSON export** (iOS: the open tab's section; web: the whole day — night + debt, daily stats + MET profile + workouts, and the heart-rate slots) | `openDayPage` "Export JSON" → `exportDayJson` (download) | `DayReportView` export menu → `DayExport` (copy / share sheet) | — | same sections as the report | — |
+| **Full-page activity report** (24h MET profile + intensity metrics) | `openDayPage`→`activitySection`, `movementSvg` | `DayReportView`→`ActivityReport`, `MetProfile` (Reports.swift) | `DayReportScreen`→`ActivityReport`, `MetProfile` (Reports.kt) | `activity_profile`, `activity_daily`, `activity` | AAD |
+| **Heart rate across the day** (per-slot 5th–95th band + median tick; beats vs 5-min averages) | `openDayPage`→`heartSection`, `hrTimelineSvg` (`GET /api/hourly-hr?minutes=`; 15 min default, 1 h switch) | `HeartRate.swift` (`HourlyHR`, hourly) | — | `oura-summary::hourly_hr::{hr_bins, hourly_hr}` (not in the summary JSON) | — |
 | Stage breakdown | `stageBar` | `StageBreakdown` | `StageBar` (Charts.kt) | `nights[].{deep,light,rem,wake}_pct` | SleepNet |
-| **Autonomic recovery by stage** (mean HR/HRV in deep/light/REM) | `sleepReport` autonomic grid | `SleepReport` `autonomicGrid` | `SleepReport` autonomic grid | `nights[].autonomic` | SleepNet (needs hypnogram) |
+| **Autonomic recovery by stage** (mean HR/HRV in deep/light/REM) | `sleepSection` autonomic grid | `SleepReport` `autonomicGrid` | `SleepReport` autonomic grid | `nights[].autonomic` | SleepNet (needs hypnogram) |
 | **Cardiovascular age** | `renderCardio` | Cardio section | Cardio section | `cardio` | CVA (web: Python · native: `CvaModel`) |
 | **VO₂max estimate** | `renderCardio` | Fitness section | Fitness section | `fitness.vo2max` | — (Jackson, model-free) |
 | Movement ridge | `ridgeSvg` | `MovementRidge` | `MovementRidge` (Charts.kt) | `activity_profile` | — (MET, model-free) |
@@ -59,6 +61,7 @@ metric there once and both clients receive it in the JSON.
 | Steps / active calories / **distance** | activity report stats | activity day stats | activity day stats | `activity_daily` (incl. `distance_m`) | — |
 | Previous days browser | `openDaysBrowser` → `openDayPage` | `AllDaysView` → `DayDetailView` | `AllDaysScreen` → `DayReportScreen` | day keys | — |
 | Device & data health | `renderDevice` | device section | device section | `device`, `streams` | — |
+| **Battery history** (level over the days with readings; charging runs drawn apart) | `renderDevice`→`batteryChart` | — | — | `device.battery_history` (`[unix, percent]`, 14 days) | — |
 
 ## The day is one unit — pair night + activity by *wake date*
 
@@ -77,6 +80,43 @@ JVM tests for it in `app/src/test/.../DayPairingTest.kt`. `nightForDay`/`night(f
 longest in-bed night for a morning so a nap doesn't shadow the real sleep.
 
 ## Where the clients diverge
+
+
+- **Automatic sleep analysis (iOS)**: opening or syncing the app reuses saved sleep
+  results and analyzes only the latest night when its result is missing. A changed
+  bedtime window counts as missing. Older missing nights require “Refresh analysis”
+  in their Sleep tab. Automatic runs do not prune the historical model cache.
+- **iOS compact disclosures**: symptom radar initially shows its status and explanation;
+  “View details” reveals measurements and personal ranges together. Ring troubleshooting
+  is a "Help & diagnostics" card of grouped rows (check data, share report, export raw
+  data, technical reports on their own page) with the reset kept apart as a destructive row.
+  These phone-layout changes are intentionally iOS-only; the underlying health data is unchanged.
+- **Manual analysis refresh (iOS)**: each day's Sleep and Activity tabs can rerun their
+  respective model from saved ring data. Sleep uses the displayed night's bedtime window
+  (paired by wake date); activity uses the selected calendar day. The action bypasses
+  that result's cache, preserves other days, and publishes successful results to the open
+  report and summary cache. This is separate from syncing new data from the ring.
+- **Raw ring data export (iOS)**: Help & diagnostics → “Export raw ring data” writes a
+  self-contained copy of the phone's SQLite store (`VACUUM INTO`, no auth key) and hands
+  it to the share sheet. On a computer it is a normal `oura --db <file> …` input, so any
+  on-phone analysis can be reproduced exactly (`oura --db exported.db dashboard --tz-offset 2`).
+- **Ring clock sanity (all three twins)**: two anchors of one boot must agree on the
+  counter rate. A counter that *stalled* between them (ring off; wall clock ran ahead)
+  takes the later anchor's offset from the stall on, using the download time to pick the
+  side. A counter that ran *faster* than wall time (a fresh ring's erratic first days,
+  weeks of ds in an hour) makes everything between the two anchors **undated**: the
+  summary, the Python runners and the iOS models all leave that data out instead of
+  scattering it over months of phantom days.
+- **On-device model caches (iOS)**: every cache file carries a store digest (row count,
+  last id, anchor count, last anchor id). When it matches, activity and illness return
+  their cached results without streaming the store; illness only scans the tags it
+  uses; CVA runs at most once per local day (vascular age moves on a scale of months and
+  every sync adds PPG segments). Activity days the model rejects are cached as failed
+  under their input fingerprint and skipped until a forced refresh or a pipeline bump.
+- **Ring clock diagnostics**: the summary JSON carries a `clock` block (per-boot ds range,
+  sync window, anchor count/sources, `undated_nights`, `warnings`) and each night carries
+  `wake_ymd`, `start_unix`, `end_unix`, `clock_source`. iOS renders the warnings on Home,
+  the per-boot table under Technical reports, and appends it to the shared diagnostic report.
 
 - **Home layout**: same day-unit model everywhere, but the two native clients use thomas.md
   Quiet Ink (warm paper, hairlines, serif titles) while the web still uses its own teal/card
@@ -138,7 +178,31 @@ which is why Oura's own app has no per-night HRV trend either.
 
 ## Known gaps
 
-### Web-only, not on the native clients
+### iOS-only, not yet on the web
+
+Now on both: the model-free Symptom Radar (`symptoms`, used when the Python runner
+has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only:
+
+- **Sleep report without a hypnogram**: iOS still draws the time-in-bed strip and the
+  signal lanes; the web returns early.
+- **Sleep score + breathing rate** (`nights[].sleep_score`, `breath_rate`).
+- **Skin temperature / latest HR vitals and trend pages**, **hourly heart rate**
+  (`hourly_hr` is FFI-only; no `/api` endpoint yet).
+- **Symptom Radar details**: all four biomarkers with their personal band
+  (`lower`/`upper`); the web lists only the flagged ones.
+
+### Web-only, not yet on iOS
+
+- **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
+  chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
+  through days with data; iOS `DayReportView` keeps tabs and reaches days via `AllDaysView`.
+- **Time-true overnight lanes**: web draws the polysomnograph lanes from `nights[].series_t`
+  (`[unix, value]` points, gaps kept). iOS still spreads `nights[].series` evenly over the
+  night, which mis-times a lane whose stream stops early (the 5-min HR averages end at wake).
+- **15-minute heart-rate slots**: the web Heart rate tab defaults to 15-minute bars
+  (`hr_bins`, with a 15 min / 1 h switch); iOS `HeartRate.swift` still shows hourly bars.
+- **Live heart rate** panel: `POST /api/live-hr` streams beats from `oura live-hr`
+  (one minute per session, stoppable) as newline-delimited JSON.
 
 - **Advanced & debugging**: on-ring feature toggles (`/api/feature`) and the per-type
   event stream. Profile editing is native on iOS and Android, including optional health
@@ -271,9 +335,24 @@ every time the ring reboots (battery drain, firmware reset). Naively anchoring e
 to one global `max_ds`/`captured_unix` scatters older boots to wildly wrong dates (a boot
 can land months in the past). The fix segments events into boot **epochs** — walk in real
 sync order `(captured_unix, then insertion id)`, split on any large backward jump in ds, then use
-the epoch's on-ring `time_sync` (`ring_timestamp` ↔ UTC) records as authoritative anchors.
-`captured_unix` is only an epoch-selection hint and a fallback for legacy data. This
-lives in **three places that must stay in sync**:
+the epoch's on-ring `time_sync` (0x42) and `rtc_beacon` (0x85)
+(`ring_timestamp` ↔ UTC) records as authoritative anchors. RTC beacons must also
+retain their JSON in the iOS metadata reader. Ignoring them can shift a whole
+night to its download time or project a new boot through an older boot's clock.
+`captured_unix` is only an epoch-selection hint and a fallback for legacy data. Every event
+resolves with a **source**: `anchor` (its own boot's time_sync/rtc_beacon/phone anchor),
+`projected` (another boot's anchor, only when this ds continues that boot's counter — a
+rebooted ring restarts near zero and must never be projected through an older boot that
+only ran at higher counts), `download_time` (capture-time arithmetic, allowed only for a
+boot drained sync after sync so the error is bounded by one sync gap) or `undated` (a boot
+downloaded in one go with no anchor). Nights whose bounds are not `anchor`/`projected` are
+**withheld** from `nights` and listed in `clock.undated_nights` — showing them dated to the
+download would put a 23:00→08:00 sleep at 07:00→15:00 on the wrong day. To make anchors
+exist for every boot, the iOS sync (`oura-core` `sync_inner`) now sends the phone clock to
+the ring (`sync_time_app`, which makes the ring log a `time_sync`) and, after a drain that saw
+new ring time, inserts a synthetic `time_sync` row (`decoded_json.source = "phone"`, body =
+unix LE + "phone") pairing the newest drained ds with the phone clock. This lives in
+**three places that must stay in sync**:
 
 - `crates/oura-summary/src/ring_time.rs` — the shared `RingClock`; fixes night/activity/
   movement **dates for both clients** at once.
@@ -291,7 +370,11 @@ The ring can close a raw `bedtime_period` during a brief awakening even though s
 continues. `oura-summary::normalize_bed_periods` repairs the model boundary in two stages:
 
 - explicit sleep-only ACM, temperature, and SpO₂ packets can extend a raw end by up to
-  three hours;
+  three hours, but only while they keep coming: the extension walks them in time order
+  and stops at the first silence over 30 minutes (`MAX_SLEEP_SUPPORT_GAP_DS`). A Ring 4
+  reports no `sleep_state`, so without this a 20-minute still spell 2.5 hours after
+  waking — resting SpO₂/temperature packets — was joined onto the night (a 09:03 wake
+  shown as 11:51);
 - when a long sleep already has at least 30 minutes of that explicit premature-end
   evidence, continuous accepted HR/IBI bursts may carry the candidate window farther.
 
@@ -350,3 +433,53 @@ temperature, time-sync, and alert events at one-minute resolution. That detector
 dynamically delivered model is not embedded in their APK. The shared summary therefore
 keeps the raw ring bounds alongside locally adjusted bounds, and only adjusts an end
 when adjacent bedtime segments or sleep-only sensor evidence support it.
+
+## Sleep coverage and refresh lifecycle
+
+Unanalysed ring epochs are `0` (unknown), never wake. Both clients leave gaps and
+withhold complete-night metrics/scores/debt for partial staging. The summary exports
+`staging_source`, `staging_coverage_pct`, `staging_complete` and `captured_unix`.
+iOS uses `stages_full` for calculations; `stages` remains the compact preview.
+Apple Health skips unknown epochs. Web motion uses timestamped `series_t.motion` bars, with `series.motion_time` as a legacy fallback. iOS uses `series.motion_time` (normalized
+positions), rendered as discrete measurements without interpolation.
+
+SleepNet output timestamps are retained on both paths and mapped onto the bedtime
+30-second grid. Input selection checks absolute time as well as relative counters;
+Ring 5 quality flags gate beat validity. Batch windows carry capture time to select
+the right boot. The latest iOS night rechecks its input fingerprint after store changes.
+
+Automatic lifecycle sync requests are coalesced and concurrent summary reloads queue
+one follow-up. iOS reports gate/clock/model stages and has a cooperative 180-second
+analysis deadline; a native Torch forward cannot safely be forcibly interrupted, so
+its watchdog reports the delay while retaining exclusive database ownership.
+Desktop Python runners have a 180-second kill/reap timeout and drain stdout concurrently.
+
+Validation uses synthetic cases; personal exports and model weights remain local.
+A report JSON alone cannot replay Gen4 inference or prove the original bedtime.
+
+GitHub iOS validation also compiles the TORCH Swift paths against a validation-only
+C bridge and runs pure planning/alignment tests. This checks model plumbing, not
+LibTorch inference; release projects never include the stub bridge.
+
+
+### CLI configuration and community integration
+
+`--db` and `--key-file` override `OURA_DB_FILE` and `OURA_KEY_FILE`. Ring operations
+look for adjacent `oura.key`, then a single `oura-<serial>.key`; multiple serial keys
+require an explicit selection. Pairing saves its default key beside the database.
+Saved-data commands do not load auth keys.
+
+CLI display commands default to the current local UTC offset on Unix (UTC on
+other platforms). `--tz-offset` accepts fractional hours, e.g. `5.5`, `5.75`, or
+`-3.5`. This remains a fixed offset across the requested history, not a named
+zone with historical DST/travel rules; use an explicit offset when needed. The
+existing integer-offset iOS FFI contract is retained.
+
+Multiple `ring_start` markers between disagreeing anchors make the interval
+between the first and last reboot undatable. Rust, Python, and Swift agree on
+this rule; model caches are invalidated for the clock/bedtime changes.
+
+The web BLE actions (sync, live HR, feature mode) share one operation gate. Live
+HR drains stderr concurrently, retains only a bounded tail, and kills/reaps a
+stalled or disconnected child before releasing the gate. Hardware/firmware live
+HR support still depends on the pinned BLE implementation.

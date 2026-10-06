@@ -1,7 +1,6 @@
 //! `oura` — a command-line client that reads data directly from an Oura ring over
 //! BLE, with no Oura cloud account. See `--help` for subcommands.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,6 +21,41 @@ mod motion_server;
 mod pyrunner;
 mod viz;
 
+fn parse_tz_offset(value: &str) -> std::result::Result<f64, String> {
+    let hours: f64 = value.parse().map_err(|_| "UTC offset must be hours, e.g. 5.5".to_owned())?;
+    if hours.is_finite() && (-24.0..=24.0).contains(&hours) { Ok(hours) }
+    else { Err("UTC offset must be finite and within -24..24 hours".to_owned()) }
+}
+
+/// Query the machine's local timezone offset in hours from UTC.
+fn local_tz_offset_hours() -> f64 {
+    #[cfg(unix)]
+    unsafe {
+        let mut now: libc::time_t = 0;
+        libc::time(&mut now);
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return 0.0;
+        }
+        tm.tm_gmtoff as f64 / 3600.0
+    }
+    #[cfg(not(unix))]
+    {
+        rusqlite::Connection::open_in_memory()
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT round((julianday('now', 'localtime') - julianday('now')) * 96.0) / 4.0",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .ok()
+            })
+            .filter(|h| h.is_finite() && (-24.0..=24.0).contains(h))
+            .unwrap_or(0.0)
+    }
+}
+
 /// Read sleep/HR/activity signals straight from an Oura ring (Ring 3/4/5).
 #[derive(Parser, Debug)]
 #[command(name = "oura", version, about)]
@@ -39,11 +73,11 @@ struct Cli {
     scan_timeout: u64,
 
     /// SQLite database path.
-    #[arg(long, global = true, default_value = "oura.db")]
+    #[arg(long, global = true, env = "OURA_DB_FILE", default_value = "oura.db")]
     db: PathBuf,
 
     /// 16-byte app-auth key as hex (file contents). Required for auth-gated ops.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "OURA_KEY_FILE")]
     key_file: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -62,9 +96,14 @@ enum Command {
     Info,
     /// Drain history events into the database (incremental).
     Sync {
-        /// Also align the ring clock to host UTC before syncing.
-        #[arg(long)]
+        /// Deprecated no-op: the ring clock is now aligned by default.
+        #[arg(long, hide = true)]
         sync_time: bool,
+        /// Do not align the ring clock to host UTC before syncing. Without the
+        /// time-sync anchor the ring writes, nights recorded since its last reboot
+        /// cannot be placed on the calendar and the dashboard withholds them.
+        #[arg(long)]
+        no_sync_time: bool,
     },
     /// Read the ring's latest cached HR / SpO2 values.
     Latest,
@@ -131,8 +170,8 @@ enum Command {
     /// needs the Python venv with torch). Not a heuristic.
     Sessions {
         /// Timezone offset (hours from UTC) for displayed times.
-        #[arg(long, default_value_t = 0)]
-        tz_offset: i64,
+        #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
+        tz_offset: f64,
         /// is_workout probability at/above which a segment is marked a workout.
         #[arg(long, default_value_t = 0.5)]
         threshold: f64,
@@ -146,8 +185,8 @@ enum Command {
     /// Runs via tools/score_sleep.py (needs the Python venv with torch).
     SleepScore {
         /// Timezone offset (hours from UTC) for the bedtime clock.
-        #[arg(long, default_value_t = 0)]
-        tz_offset: i64,
+        #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
+        tz_offset: f64,
         /// Trends CSV for calibration (default: auto-find ~/Desktop/oura_*trends.csv).
         #[arg(long)]
         csv: Option<PathBuf>,
@@ -161,8 +200,8 @@ enum Command {
     /// contributors are provisional until ~14 days of history accrue.
     ReadinessScore {
         /// Timezone offset (hours from UTC) for the bedtime clock.
-        #[arg(long, default_value_t = 0)]
-        tz_offset: i64,
+        #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
+        tz_offset: f64,
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -197,8 +236,8 @@ enum Command {
         #[arg(long, default_value_t = 8090)]
         port: u16,
         /// Timezone offset (hours from UTC) for displayed times.
-        #[arg(long, default_value_t = 0)]
-        tz_offset: i64,
+        #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
+        tz_offset: f64,
         /// Sex for the cardiovascular-age model: M | F | O.
         #[arg(long, default_value = "M")]
         sex: String,
@@ -245,6 +284,38 @@ fn feature_state_name(state: u8) -> &'static str {
     }
 }
 
+fn discover_key(db: &Path) -> Result<Option<PathBuf>> {
+    let candidate = db.with_file_name("oura.key");
+    if candidate.is_file() {
+        return Ok(Some(candidate));
+    }
+    let dir = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(None);
+    };
+    let mut keys: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("oura-") && n.ends_with(".key"))
+        })
+        .collect();
+    keys.sort();
+    match keys.len() {
+        0 => Ok(None),
+        1 => Ok(keys.pop()),
+        _ => Err(anyhow!(
+            "multiple adjacent ring keys; select one with --key-file or OURA_KEY_FILE"
+        )),
+    }
+}
+
 fn load_key(path: &Option<PathBuf>) -> Result<Option<[u8; 16]>> {
     let Some(path) = path else { return Ok(None) };
     // A missing file is not an error: `pair` writes it, others treat it as "no key".
@@ -262,9 +333,9 @@ fn load_key(path: &Option<PathBuf>) -> Result<Option<[u8; 16]>> {
 
 /// Generate a random 16-byte auth key from the OS CSPRNG.
 fn generate_key() -> Result<[u8; 16]> {
-    let mut file = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
     let mut key = [0u8; 16];
-    file.read_exact(&mut key).context("reading random bytes")?;
+    getrandom::fill(&mut key)
+        .map_err(|e| anyhow!("generating random auth key: {e}"))?;
     Ok(key)
 }
 
@@ -327,14 +398,36 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
-    let key = load_key(&cli.key_file)?;
+    let mut cli = Cli::parse();
+    let uses_ring = matches!(
+        cli.command,
+        Command::Pair
+            | Command::Info
+            | Command::Sync { .. }
+            | Command::Latest
+            | Command::LiveHr { .. }
+            | Command::Accel { .. }
+            | Command::SleepAnalyze { .. }
+            | Command::Viz { .. }
+            | Command::Game { .. }
+            | Command::Rdata { .. }
+            | Command::FeatureMode { .. }
+    );
+    if cli.key_file.is_none() && (uses_ring || matches!(cli.command, Command::Dashboard { .. })) {
+        cli.key_file = discover_key(&cli.db)?;
+    }
+    // Saved-data commands never need an auth key, even when one is configured.
+    let key = if uses_ring {
+        load_key(&cli.key_file)?
+    } else {
+        None
+    };
 
     match &cli.command {
         Command::Scan => cmd_scan(&cli).await,
         Command::Pair => cmd_pair(&cli).await,
         Command::Info => cmd_info(&cli, &key).await,
-        Command::Sync { sync_time } => cmd_sync(&cli, &key, *sync_time).await,
+        Command::Sync { no_sync_time, .. } => cmd_sync(&cli, &key, !*no_sync_time).await,
         Command::Latest => cmd_latest(&cli, &key).await,
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
@@ -548,7 +641,7 @@ async fn cmd_feature_status(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
 /// runs the model in-process via LibTorch; otherwise it shells out to the
 /// equivalent `tools/run_activity_model.py`. Either way the model — not a
 /// heuristic — produces the labels.
-fn cmd_sessions(cli: &Cli, tz_offset: i64, threshold: f64, json: bool) -> Result<()> {
+fn cmd_sessions(cli: &Cli, tz_offset: f64, threshold: f64, json: bool) -> Result<()> {
     // The runner is owned by open_health. Private model files may be supplied
     // separately (OURA_MODELS_DIR) or live in the sibling open_oura checkout.
     let root = pyrunner::require_repo_root(
@@ -595,7 +688,7 @@ fn cmd_sessions(cli: &Cli, tz_offset: i64, threshold: f64, json: bool) -> Result
 /// tools/score_sleep.py (SleepNet hypnogram + calibrated contributor curves +
 /// combiner weights). Always shells out to Python, which already owns the torch
 /// model path; there is no native LibTorch backend for the scorer.
-fn cmd_sleep_score(cli: &Cli, tz_offset: i64, csv: Option<PathBuf>, json: bool) -> Result<()> {
+fn cmd_sleep_score(cli: &Cli, tz_offset: f64, csv: Option<PathBuf>, json: bool) -> Result<()> {
     let root =
         pyrunner::require_repo_root(Path::new("tools/score_sleep.py"), "tools/score_sleep.py")?;
     let db = pyrunner::resolve_db(&cli.db)?;
@@ -629,7 +722,7 @@ fn cmd_sleep_score(cli: &Cli, tz_offset: i64, csv: Option<PathBuf>, json: bool) 
 /// Readiness Score live from ring data: rebuild the daily_summary + rolling
 /// baselines (tools/build_daily.py), then score with the calibrated curves
 /// (tools/score_readiness.py). Both run via the Python venv with torch.
-fn cmd_readiness_score(cli: &Cli, tz_offset: i64, json: bool) -> Result<()> {
+fn cmd_readiness_score(cli: &Cli, tz_offset: f64, json: bool) -> Result<()> {
     let root = pyrunner::require_repo_root(
         Path::new("tools/score_readiness.py"),
         "tools/score_readiness.py",
@@ -743,7 +836,7 @@ async fn cmd_pair(cli: &Cli) -> Result<()> {
     let out = cli
         .key_file
         .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("oura-{serial}.key")));
+        .unwrap_or_else(|| cli.db.with_file_name(format!("oura-{serial}.key")));
 
     // Persist the key before installing it, so a crash mid-pair never loses the
     // only copy of a key that may already be live on the ring.
@@ -825,34 +918,44 @@ async fn drain_events_into_store(
 ) -> Result<(u32, u32)> {
     let db_err = std::cell::RefCell::new(None);
     let cursor_advanced = std::cell::Cell::new(false);
+    // Events are buffered per batch and committed with the cursor in ONE
+    // transaction. Row-by-row autocommit under WAL + synchronous=FULL costs an
+    // fsync per event, which made 255-event legacy (Gen 3) batches crawl on slow
+    // storage (same as open_oura's CLI).
+    let pending = std::cell::RefCell::new(Vec::new());
+    let batch_started = std::cell::Cell::new(std::time::Instant::now());
     let outcome = client
         .drain_events(
             cursor,
             |ev| {
-                if db_err.borrow().is_some() {
-                    return false;
-                }
-                match store.insert_event(serial, ev) {
-                    Ok(true) => inserted.set(inserted.get() + 1),
-                    Ok(false) => {}
-                    Err(e) => *db_err.borrow_mut() = Some(e),
-                }
-                db_err.borrow().is_none()
+                pending.borrow_mut().push(ev.clone());
+                true
             },
             |p| {
-                if db_err.borrow().is_some() {
-                    return false;
+                let link = batch_started.get().elapsed();
+                let db_started = std::time::Instant::now();
+                let events = std::mem::take(&mut *pending.borrow_mut());
+                match store.commit_batch(serial, &events, p.next_cursor) {
+                    Ok(n) => {
+                        inserted.set(inserted.get() + n);
+                        cursor_advanced.set(true);
+                    }
+                    Err(e) => {
+                        *db_err.borrow_mut() = Some(e);
+                        return false;
+                    }
                 }
-                match store.set_cursor(serial, p.next_cursor) {
-                    Ok(()) => cursor_advanced.set(true),
-                    Err(e) => *db_err.borrow_mut() = Some(e),
-                }
+                // Per-batch split: tells a slow BLE link apart from slow storage.
                 println!(
-                    "  … {} events so far, ~{:.1} KB left on ring",
+                    "  … {} events so far, ~{:.1} KB left on ring ({} in batch: link {:.1}s, db {:.2}s)",
                     p.events_synced,
-                    p.bytes_left as f64 / 1024.0
+                    p.bytes_left as f64 / 1024.0,
+                    events.len(),
+                    link.as_secs_f64(),
+                    db_started.elapsed().as_secs_f64(),
                 );
-                db_err.borrow().is_none()
+                batch_started.set(std::time::Instant::now());
+                true
             },
         )
         .await?;
@@ -880,8 +983,21 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         .context("running app-style stream setup")?;
 
     if sync_time {
-        client.sync_time_app().await.context("syncing time")?;
+        // Same order as the iOS app: the official-app counter form, then the older
+        // unix+timezone form. The anchor event this writes is what dates the history;
+        // a failure is worth a warning, not a failed sync.
+        if let Err(e) = client.sync_time_app().await {
+            tracing::debug!("app-style time sync failed ({e}); trying the legacy form");
+            if let Err(e) = client.sync_time().await {
+                eprintln!(
+                    "warning: could not align the ring clock ({e}); recent nights may stay undated"
+                );
+            }
+        }
     }
+    // Like the iOS app: ask the ring to postprocess its sleep before the drain, so a
+    // finished night's bedtime_period lands in this sync instead of the next one.
+    let _ = client.check_sleep_analysis(false).await;
 
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
     let info = client.firmware().await.ok();
@@ -915,6 +1031,14 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         next_cursor
     );
 
+    // Same anchor the iOS sync writes (oura-core `phone_anchor_event`): without it a
+    // CLI-synced DB has no wall-clock point on the near side of a battery brownout.
+    if let Some(anchor) = phone_anchor_event(events_synced, next_cursor) {
+        if let Err(e) = store.insert_event(&serial, &anchor) {
+            eprintln!("  … phone anchor not saved: {e}");
+        }
+    }
+
     // While connected + authed, snapshot the real on-ring feature modes so the
     // dashboard can show actual on/off (not just "events seen recently"). Best-effort:
     // written next to the DB as feature_modes.json; a read failure never fails the sync.
@@ -941,6 +1065,30 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
 
     let _ = client.transport().disconnect().await;
     Ok(())
+}
+
+/// A synthetic `time_sync` (0x42) row pairing the newest drained ring timestamp with
+/// the host clock; body and decoded shape match oura-core's phone anchor.
+fn phone_anchor_event(
+    events_synced: u32,
+    next_cursor: u32,
+) -> Option<oura_protocol::events::RingEvent> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u32::try_from(d.as_secs()).ok())?;
+    if events_synced == 0 || next_cursor == 0 {
+        return None;
+    }
+    let mut body = now.to_le_bytes().to_vec();
+    body.extend_from_slice(b"phone");
+    Some(oura_protocol::events::RingEvent {
+        tag: 0x42,
+        name: oura_protocol::events::event_name(0x42),
+        timestamp: next_cursor - 1,
+        body,
+        decoded: Some(serde_json::json!({ "unix_time": now, "source": "phone" })),
+    })
 }
 
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
@@ -1380,7 +1528,7 @@ async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
     let (_, idle) = client.rdata_state().await?;
     println!("baseline idle status = {idle}\n");
     for (label, types, start, cur) in variants {
-        let (csub, cst) = client.rdata_configure(types, *start, *cur).await?;
+        let (csub, cst) = client.rdata_configure(*types, *start, *cur).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let (ssub, sst) = client.rdata_state().await?;
         let engaged = sst != idle;
@@ -1409,7 +1557,8 @@ async fn cmd_events(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     for serial in serials {
-        println!("Device {serial}:");
+        let (raw, decoded) = store.serial_event_totals(&serial)?;
+        println!("Device {serial} ({raw} raw, {decoded} decoded):");
         for (name, count) in store.event_counts(&serial)? {
             println!("  {count:>6}  {name}");
         }
@@ -1419,7 +1568,31 @@ async fn cmd_events(cli: &Cli) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_rejected_history_cursor;
+    use super::*;
+
+    #[test]
+    fn timezone_parser_preserves_fractional_overrides() {
+        for hours in [5.5, 5.75, -3.5] {
+            let cli = Cli::try_parse_from(["oura", "dashboard", "--tz-offset", &hours.to_string()]).unwrap();
+            let Command::Dashboard { tz_offset, .. } = cli.command else { panic!("wrong command") };
+            assert_eq!(tz_offset, hours);
+        }
+        assert!(Cli::try_parse_from(["oura", "dashboard", "--tz-offset", "NaN"]).is_err());
+    }
+
+    #[test]
+    fn discovery_finds_pairing_key_and_requires_disambiguation() {
+        let dir = std::env::temp_dir().join(format!("oura-key-discovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        std::fs::write(dir.join("oura-S1.key"), "test").unwrap();
+        assert_eq!(discover_key(&db).unwrap(), Some(dir.join("oura-S1.key")));
+        std::fs::write(dir.join("oura-S2.key"), "test").unwrap();
+        assert!(discover_key(&db).is_err());
+        std::fs::write(dir.join("oura.key"), "test").unwrap();
+        assert_eq!(discover_key(&db).unwrap(), Some(dir.join("oura.key")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn recognizes_ring5_rejected_history_cursor() {
@@ -1427,5 +1600,13 @@ mod tests {
             "protocol error: extended history request failed with result code 0xff"
         ));
         assert!(!is_rejected_history_cursor("BLE link lost mid-batch"));
+    }
+
+    #[test]
+    fn generate_key_uses_os_csprng() {
+        let k1 = generate_key().unwrap();
+        let k2 = generate_key().unwrap();
+        assert_ne!(k1, [0u8; 16]);
+        assert_ne!(k1, k2);
     }
 }
