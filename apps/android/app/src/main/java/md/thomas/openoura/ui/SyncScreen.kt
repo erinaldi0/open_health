@@ -55,7 +55,7 @@ import md.thomas.openoura.store.isValidRingKey
  * diagnostics transcript. Port of `SyncView` in apps/ios/OuraApp/OuraApp.swift.
  */
 @Composable
-fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
+fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenRawData: () -> Unit = {}) {
     val colors = Obs.colors
     val context = LocalContext.current
     var key by remember { mutableStateOf(RingKeyStore.load(context) ?: "") }
@@ -180,6 +180,7 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
             }
 
             Rule("your data")
+            ActionRow("Browse raw data", onOpenRawData)
             ActionRow("Check database") {
                 if (dataBusy) return@ActionRow
                 dataBusy = true

@@ -41,6 +41,8 @@ sealed interface Route {
     data object SleepDebt : Route
     data class Vital(val kind: VitalKind) : Route
     data object LiveHeartRate : Route
+    /** Reached from Sync → "Browse raw data"; back returns to Sync. */
+    data object RawData : Route
 }
 
 @Composable
@@ -51,7 +53,9 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
     var healthNote by remember { mutableStateOf<String?>(null) }
     var healthExportEnabled by remember { mutableStateOf(HealthExport.isEnabled(context)) }
 
-    BackHandler(enabled = route != Route.Home) { route = Route.Home }
+    BackHandler(enabled = route != Route.Home) {
+        route = if (route == Route.RawData) Route.Sync else Route.Home
+    }
 
     // Opportunistic refresh on launch and when returning to the app — the same policy as
     // iOS's scenePhase hook, now routed through the same WorkManager worker as every other
@@ -108,6 +112,7 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
             startOnSleep = r.sleep,
             onBack = { route = Route.Home },
             modifier = base,
+            onSummaryChanged = { vm.reload() },
         )
 
         Route.AllDays -> if (s == null) route = Route.Home else AllDaysScreen(
@@ -132,7 +137,10 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
             ring = ring,
             onBack = { route = Route.Home },
             onSynced = { vm.reload() },
+            onOpenRawData = { route = Route.RawData },
         )
+
+        Route.RawData -> RawDataScreen(onBack = { route = Route.Sync })
 
         Route.LiveHeartRate -> LiveHeartRateScreen(
             onBack = { route = Route.Home },

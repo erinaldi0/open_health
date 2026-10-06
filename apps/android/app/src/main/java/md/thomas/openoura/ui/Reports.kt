@@ -1,5 +1,6 @@
 package md.thomas.openoura.ui
 
+import android.app.TimePickerDialog
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -33,6 +34,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import md.thomas.openoura.data.BedtimeOverrideStore
+import md.thomas.openoura.store.DB
 import md.thomas.openoura.data.NightRow
 import md.thomas.openoura.data.Sleep
 import md.thomas.openoura.data.SleepScore
@@ -81,6 +89,7 @@ fun DayReportScreen(
     startOnSleep: Boolean,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    onSummaryChanged: () -> Unit = {},
 ) {
     val colors = Obs.colors
     var sleep by remember(day) { mutableStateOf(startOnSleep) }
@@ -115,7 +124,7 @@ fun DayReportScreen(
                 if (night == null) {
                     item { EmptyNote("No sleep recorded for this morning.") }
                 } else {
-                    item { SleepReport(s, night) }
+                    item { SleepReport(s, night, day, onSummaryChanged = onSummaryChanged) }
                 }
             } else {
                 item { ActivityReport(s, day) }
@@ -125,8 +134,15 @@ fun DayReportScreen(
 }
 
 @Composable
-fun SleepReport(s: Summary, night: NightRow, modifier: Modifier = Modifier) {
+fun SleepReport(
+    s: Summary,
+    night: NightRow,
+    day: String,
+    modifier: Modifier = Modifier,
+    onSummaryChanged: () -> Unit = {},
+) {
     val colors = Obs.colors
+    var editingBedtime by remember(night.id) { mutableStateOf(false) }
     // Full-resolution hypnogram (never the 120-cell preview); metrics return null for a
     // partially staged night rather than counting its unknown epochs as awake.
     val smoothed = remember(night) { night.hypnogram?.takeIf { it.size > 1 }?.let { Sleep.smooth(it, 5) } }
@@ -146,6 +162,20 @@ fun SleepReport(s: Summary, night: NightRow, modifier: Modifier = Modifier) {
                 (night.start ?: "—") to "bedtime",
             )
         )
+        Text(
+            "${night.start ?: "—"}–${night.end ?: "—"}  ·  " +
+                if (night.isBedtimeManual) "bedtime edited" else "adjust bedtime",
+            modifier = Modifier.clickable { editingBedtime = !editingBedtime },
+            fontFamily = Obs.mono,
+            fontSize = 11.sp,
+            color = if (editingBedtime) colors.chart else colors.link,
+        )
+        if (editingBedtime) {
+            BedtimeEditor(night, nightKey = night.date ?: day, onDone = { changed ->
+                editingBedtime = false
+                if (changed) onSummaryChanged()
+            })
+        }
 
         night.sleepScore?.let { score ->
             Rule("sleep score")
@@ -470,3 +500,98 @@ fun SleepScoreCard(score: SleepScore, breathRate: Double?, modifier: Modifier = 
         )
     }
 }
+
+/**
+ * Inline bedtime / wake-up correction. Writes `bedtime_overrides.json` (see
+ * [BedtimeOverrideStore]); the reload that follows rebuilds the night in the core and, in
+ * the full build, re-stages it (its staging cache is keyed by the new window). Mirrors iOS
+ * `SleepReport.bedtimeEditor`.
+ */
+@Composable
+private fun BedtimeEditor(night: NightRow, nightKey: String, onDone: (changed: Boolean) -> Unit) {
+    val colors = Obs.colors
+    val context = LocalContext.current
+    var start by remember(night.id) { mutableStateOf(night.start ?: "23:00") }
+    var end by remember(night.id) { mutableStateOf(night.end ?: "07:00") }
+    var saving by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    fun pick(current: String, onPicked: (String) -> Unit) {
+        val m = BedtimeOverrideStore.hmMinutes(current)
+        TimePickerDialog(context, { _, h, min -> onPicked("%02d:%02d".format(h, min)) }, m / 60, m % 60, true).show()
+    }
+    fun persist(action: (List<java.io.File>) -> Unit) {
+        saving = true
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { action(overrideFiles(context)) }
+            }
+            saving = false
+            result.onSuccess { onDone(true) }.onFailure { error = "Couldn't save: ${it.message ?: it}" }
+        }
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(colors.paper.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            for ((label, value, set) in listOf(
+                Triple("BEDTIME", start) { v: String -> start = v },
+                Triple("WAKE-UP", end) { v: String -> end = v },
+            )) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(label, fontFamily = Obs.mono, fontSize = 9.sp, letterSpacing = 1.1.sp, color = colors.ink2)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        value,
+                        modifier = Modifier
+                            .clickable(enabled = !saving) { pick(value, set) }
+                            .background(colors.rule.copy(alpha = 0.35f), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        fontFamily = Obs.mono,
+                        fontSize = 14.sp,
+                        color = colors.ink,
+                    )
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (saving) "saving…" else "apply",
+                modifier = Modifier
+                    .clickable(enabled = !saving) {
+                        persist { files -> BedtimeOverrideStore.set(files, nightKey, night, start, end) }
+                    }
+                    .background(colors.ink, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                fontFamily = Obs.mono, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = colors.paper,
+            )
+            if (night.isBedtimeManual || night.rawStart != null) {
+                Text(
+                    "reset" + (night.rawStart?.let { " ($it–${night.rawEnd ?: ""})" } ?: ""),
+                    modifier = Modifier.clickable(enabled = !saving) {
+                        persist { files -> BedtimeOverrideStore.clear(files, nightKey, night) }
+                    },
+                    fontFamily = Obs.mono, fontSize = 11.sp, color = colors.ink2,
+                )
+            }
+            Text(
+                "cancel",
+                modifier = Modifier.clickable(enabled = !saving) { onDone(false) },
+                fontFamily = Obs.mono, fontSize = 11.sp, color = colors.muted,
+            )
+        }
+        error?.let { Text(it, fontFamily = Obs.mono, fontSize = 11.sp, color = colors.bad) }
+    }
+}
+
+/** The override file beside the DB the core reads, and beside the writable copy (as iOS). */
+private fun overrideFiles(context: android.content.Context): List<java.io.File> = listOf(
+    java.io.File(java.io.File(DB.readPath(context)).parentFile, BedtimeOverrideStore.FILE),
+    java.io.File(DB.file(context).parentFile, BedtimeOverrideStore.FILE),
+)
