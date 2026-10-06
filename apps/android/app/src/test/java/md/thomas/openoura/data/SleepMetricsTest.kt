@@ -147,4 +147,54 @@ class SleepMetricsTest {
         assertNull(a.hrDeep)
         assertTrue(!a.any)
     }
+
+    @Test
+    fun `metrics and asleepS refuse a hypnogram with unstaged epochs`() {
+        // Unknown (0) epochs would otherwise count as awake. Rust and Swift refuse too.
+        val partial = List(100) { 2 } + List(20) { 0 }
+        assertNull(Sleep.metrics(partial, 3600.0))
+        assertEquals(0, Sleep.asleepS(partial, 3600.0))
+    }
+
+    @Test
+    fun `autonomic places timed samples at their own timestamps`() {
+        // 0–50 % of the night deep, 50–100 % REM. Both HR samples land in the first half
+        // even though they're the first and last of the list — index-fraction would have
+        // put the second one in REM.
+        val stages = List(10) { 1 } + List(10) { 3 }
+        val a = Sleep.autonomicTimed(
+            hrTimed = listOf(listOf(1000.0, 50.0), listOf(1400.0, 60.0)),
+            hrvTimed = listOf(listOf(1100.0, 40.0), listOf(1900.0, 80.0)),
+            startUnix = 1000, endUnix = 2000, stages = stages,
+        )
+        assertEquals(55.0, a.hrDeep!!, 1e-9)
+        assertNull(a.hrRem)
+        assertEquals(40.0, a.hrvDeep!!, 1e-9)
+        assertEquals(80.0, a.hrvRem!!, 1e-9)
+    }
+
+    @Test
+    fun `autonomic drops timed samples outside the night`() {
+        val a = Sleep.autonomicTimed(
+            hrTimed = listOf(listOf(900.0, 99.0), listOf(1500.0, 50.0), listOf(2100.0, 99.0)),
+            hrvTimed = emptyList(), startUnix = 1000, endUnix = 2000, stages = List(4) { 2 },
+        )
+        assertEquals(50.0, a.hrLight!!, 1e-9)
+    }
+
+    @Test
+    fun `autonomic for a night prefers series_t, then the core's values, then index fraction`() {
+        val stages = List(4) { 1 }
+        val timed = NightRow(
+            startUnix = 0, endUnix = 100,
+            seriesT = NightTimedSeries(hr = listOf(listOf(50.0, 61.0))),
+            autonomic = StageAutonomicJson(hrDeep = 70.0),
+            series = NightSeries(hr = listOf(80.0, 80.0)),
+        )
+        assertEquals(61.0, Sleep.autonomic(timed, stages).hrDeep!!, 1e-9)
+        val precomputed = timed.copy(seriesT = null)
+        assertEquals(70.0, Sleep.autonomic(precomputed, stages).hrDeep!!, 1e-9)
+        val legacy = precomputed.copy(autonomic = null)
+        assertEquals(80.0, Sleep.autonomic(legacy, stages).hrDeep!!, 1e-9)
+    }
 }

@@ -203,6 +203,12 @@ private fun HypnoCanvas(stages: List<Int>, colors: ObsColors) {
         var prev: Float? = null
         while (i < n) {
             val code = stages[i]
+            // 0 = not staged: break the trace instead of drawing a run at the awake level.
+            if (code == 0) {
+                prev = null
+                i++
+                continue
+            }
             var j = i
             while (j < n && stages[j] == code) j++
             val x1 = xOf(i)
@@ -262,7 +268,7 @@ private fun SignalCanvas(s: SignalLane, ruleColor: Color) {
 
 private fun buildLanes(night: NightRow, chart: Color): List<Lane> {
     val out = ArrayList<Lane>()
-    night.stages?.takeIf { it.size > 1 }?.let {
+    night.hypnogram?.takeIf { it.size > 1 }?.let {
         out.add(Lane("Hypnogram", "", null, Sleep.smooth(it, 5)))
     }
     fun sig(label: String, unit: String, v: List<Double>?, dp: Int = 0, span: List<Double>? = null) {

@@ -125,18 +125,14 @@ fun DayReportScreen(
 @Composable
 fun SleepReport(s: Summary, night: NightRow, modifier: Modifier = Modifier) {
     val colors = Obs.colors
-    val smoothed = remember(night) { night.stages?.takeIf { it.size > 1 }?.let { Sleep.smooth(it, 5) } }
+    // Full-resolution hypnogram (never the 120-cell preview); metrics return null for a
+    // partially staged night rather than counting its unknown epochs as awake.
+    val smoothed = remember(night) { night.hypnogram?.takeIf { it.size > 1 }?.let { Sleep.smooth(it, 5) } }
     val metrics = remember(night, smoothed) {
-        smoothed?.let { Sleep.metrics(it, (night.inBedH ?: 0.0) * 3600) }
+        smoothed?.let { Sleep.metrics(it, night.durationS) }
     }
     val autonomic = remember(night, smoothed) {
-        smoothed?.let {
-            Sleep.autonomic(
-                hr = night.series?.hr ?: emptyList(),
-                hrv = night.series?.hrv ?: emptyList(),
-                stages = it,
-            )
-        }
+        smoothed?.let { Sleep.autonomic(night, it) }
     }
 
     Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(18.dp)) {

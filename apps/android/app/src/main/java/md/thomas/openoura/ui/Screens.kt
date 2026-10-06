@@ -98,7 +98,7 @@ fun AllDaysScreen(s: Summary, onOpenDay: (String) -> Unit, onBack: () -> Unit) {
                             color = colors.ink2,
                         )
                     }
-                    night?.stages?.takeIf { it.size > 1 }?.let { Hypnogram(it, height = 26.dp) }
+                    night?.hypnogram?.takeIf { it.size > 1 }?.let { Hypnogram(it, height = 26.dp) }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                         Text(
                             "${fmtSteps(daily?.steps)} steps",

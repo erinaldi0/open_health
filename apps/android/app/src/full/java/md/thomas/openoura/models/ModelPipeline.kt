@@ -93,7 +93,9 @@ object ModelPipeline {
         if (sleepErr != null && staged.isEmpty() && previous != null) {
             staged = previous.nights.mapNotNull { night ->
                 val sds = night.startDs ?: return@mapNotNull null
-                val stages = night.stages?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                // Only SleepNet's own output — not the ring hypnogram the core supplies.
+                if (night.stagingSource != "sleepnet") return@mapNotNull null
+                val stages = night.stagesFull?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
                 sds.toString() to stages
             }.toMap()
         }
@@ -107,13 +109,21 @@ object ModelPipeline {
                 val total = stages.size.toDouble()
                 fun pct(code: Int) = (stages.count { it == code } / total * 100).roundToLong().toDouble()
                 val asleep = total - stages.count { it == 4 }
+                val complete = stages.all { it in 1..4 }
+                // Mirrors iOS Core.swift: SleepNet replaces the ring's hypnogram in BOTH the
+                // preview and the full-resolution field, so metrics can't read the old one.
                 night.copy(
                     stages = stages,
+                    stagesFull = stages,
+                    stagingSource = "sleepnet",
+                    stagingCompleteJson = complete,
+                    stagingCoveragePct = stages.count { it in 1..4 } / total * 100,
                     deepPct = pct(1),
                     lightPct = pct(2),
                     remPct = pct(3),
                     wakePct = pct(4),
-                    efficiency = (asleep / total * 100).roundToLong().toDouble(),
+                    efficiency = if (complete) (asleep / total * 100).roundToLong().toDouble() else null,
+                    sleepScore = null, // the core's score describes a different hypnogram
                 )
             }
         )

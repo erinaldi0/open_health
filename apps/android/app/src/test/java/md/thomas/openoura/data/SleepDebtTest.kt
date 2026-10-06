@@ -148,4 +148,34 @@ class SleepDebtTest {
         assertEquals("2026-03-30", d.days.last().date)
         assertEquals("2026-03-17", d.days.first().date)
     }
+
+    @Test
+    fun `a day with a partially staged night is left out, not under-counted`() {
+        val wake = "2026-03-14"
+        val complete = (1 until 6).map { night(LocalDate.parse(wake).minusDays(it.toLong()).toString(), 8.0) }
+        // The anchor morning: 960 epochs but a quarter of them unstaged (code 0).
+        val partial = night(wake, 8.0).copy(stages = List(720) { 1 } + List(240) { 0 })
+        val d = Summary(nights = complete + partial).stagedSleepDebt()!!
+        // The partial day isn't an "under-slept" day — it's absent, so the newest valid
+        // day becomes the anchor.
+        assertEquals("2026-03-13", d.days.last().date)
+    }
+
+    @Test
+    fun `the full hypnogram is used, not the 120-cell preview`() {
+        // Preview says all deep; the real hypnogram is half awake → 4 h asleep, not 8 h.
+        val n = night("2026-03-14", 8.0).copy(
+            stages = List(120) { 1 },
+            stagesFull = List(480) { 1 } + List(480) { 4 },
+        )
+        val day = Summary(nights = listOf(n)).stagedSleepDebt()!!.days.last()
+        assertEquals(240.0, day.totalSleepMin!!, 1e-9)
+    }
+
+    @Test
+    fun `exact wall-clock bounds win over the rounded in-bed hours`() {
+        val n = night("2026-03-14", 8.0).copy(startUnix = 1_000_000, endUnix = 1_000_000 + 7 * 3600)
+        val day = Summary(nights = listOf(n)).stagedSleepDebt()!!.days.last()
+        assertEquals(420.0, day.totalSleepMin!!, 1e-9)
+    }
 }

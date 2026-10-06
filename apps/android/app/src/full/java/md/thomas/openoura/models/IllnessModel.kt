@@ -167,8 +167,12 @@ object IllnessModel {
             if (skin[i].isFinite() && baseTemp.isFinite()) (skin[i] - baseTemp).toFloat()
             else Float.NaN
         }
-        val sedC = FloatArray(N_DAYS) { i -> sed[anchor - i]?.toFloat() ?: Float.NaN }
-        val restC = FloatArray(N_DAYS) { i -> rest[anchor - i]?.toFloat() ?: Float.NaN }
+        // Oura pairs each night with the full day *before* it (`activityMap.get(day.minusDays(1))`
+        // in the Symptom Radar input builder). Feeding the wake day itself gave the model a
+        // near-empty morning, which reads as a calm day and drags the score down on exactly
+        // the nights that matter. Same fix as iOS IllnessModel / run_illness_model.py.
+        val sedC = FloatArray(N_DAYS) { i -> sed[anchor - i - 1]?.toFloat() ?: Float.NaN }
+        val restC = FloatArray(N_DAYS) { i -> rest[anchor - i - 1]?.toFloat() ?: Float.NaN }
 
         // 301/302 guards (mirror the model's own input validator)
         if (!tempDev[0].isFinite()) {

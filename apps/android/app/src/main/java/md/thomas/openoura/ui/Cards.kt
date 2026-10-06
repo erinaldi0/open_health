@@ -81,7 +81,7 @@ fun TodayCard(
                     )
                 }
             }
-            val stages = night?.stages
+            val stages = night?.hypnogram
             if (stages != null && stages.size > 1) {
                 Hypnogram(stages, height = 34.dp)
             } else if (night?.efficiency != null) {

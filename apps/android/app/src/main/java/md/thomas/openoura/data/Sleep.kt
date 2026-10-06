@@ -13,9 +13,10 @@ import kotlin.math.min
 // identical: Rust (`oura-summary` sleep_metrics / smooth_stages / count_bouts /
 // count_periods / sleep_debt_summary / sleep_need_s) for the web, Swift
 // (apps/ios/OuraApp/Reports.swift `Sleep.*` / `Summary.stagedSleepDebt`) for iOS, and
-// here for Android. Android — like iOS — runs build_summary with NoModelRunner, so the
-// FFI leaves `stages_full`/`metrics`/`autonomic` empty and we recompute from the
-// on-device SleepNet hypnogram. If you change a smoothing window or a metric
+// here for Android. The FFI JSON now carries the ring's own hypnogram (`stages_full`)
+// even in the model-free build; the on-device SleepNet replaces it when it runs. Either
+// way metrics are recomputed here from the FULL hypnogram (`NightRow.hypnogram`), never
+// the 120-cell `stages` preview. If you change a smoothing window or a metric
 // definition, change all three. See docs/clients.md.
 
 /** Swift's `Double.rounded()` — round half away from zero, not Kotlin's default. */
@@ -38,9 +39,8 @@ data class SleepMetrics(
 
 /**
  * Mean HR/HRV per sleep stage — deep-sleep HRV is the recovery-relevant number. Mirror
- * of oura-summary `autonomic_by_stage` (which the FFI leaves null under NoModelRunner).
- * Like iOS, we align the even-spread `series` to stages by index fraction rather than
- * the server's per-sample timestamps, so values can differ by a hair; see docs/clients.md.
+ * of oura-summary `autonomic_by_stage`: each `series_t` sample is assigned to the stage at
+ * its actual timestamp, exactly like the core and iOS `Sleep.autonomic(night:stages:)`.
  */
 data class StageAutonomic(
     val hrvDeep: Double? = null,
@@ -56,8 +56,73 @@ data class StageAutonomic(
 
 object Sleep {
 
+    /** A hypnogram is usable for metrics only when every epoch is a real stage (1–4). */
+    private fun fullyStaged(stages: List<Int>): Boolean = stages.all { it in 1..4 }
+
     /**
-     * Mean of each stage's samples, mapping series index → stage by fraction of the night.
+     * Resolve stage-specific HR and HRV for [night]: timestamped `series_t` samples first,
+     * then the core's precomputed `autonomic`, and the index-fraction method only for
+     * legacy cached summaries without timestamps. Mirrors iOS `Sleep.autonomic(night:stages:)`.
+     */
+    fun autonomic(night: NightRow, stages: List<Int>): StageAutonomic {
+        val timed = night.seriesT
+        val start = night.startUnix
+        val end = night.endUnix
+        if (timed != null && (timed.hr.isNotEmpty() || timed.hrv.isNotEmpty()) &&
+            start != null && end != null && end > start
+        ) {
+            return autonomicTimed(timed.hr, timed.hrv, start, end, stages)
+        }
+        night.autonomic?.let { a ->
+            val pre = StageAutonomic(a.hrvDeep, a.hrvLight, a.hrvRem, a.hrDeep, a.hrLight, a.hrRem)
+            if (pre.any) return pre
+        }
+        return autonomic(night.series?.hr ?: emptyList(), night.series?.hrv ?: emptyList(), stages)
+    }
+
+    /**
+     * Mean of each stage's `[unix_s, value]` samples, placing each at its own timestamp.
+     * Mirrors oura-summary `autonomic_by_stage` and iOS `Sleep.autonomic(hrTimed:…)`.
+     */
+    fun autonomicTimed(
+        hrTimed: List<List<Double>>,
+        hrvTimed: List<List<Double>>,
+        startUnix: Long,
+        endUnix: Long,
+        stages: List<Int>,
+    ): StageAutonomic {
+        if (stages.isEmpty() || endUnix <= startUnix) return StageAutonomic()
+        val start = startUnix.toDouble()
+        val span = (endUnix - startUnix).toDouble()
+        fun means(pts: List<List<Double>>): Map<Int, Double> {
+            val sum = HashMap<Int, Double>()
+            val cnt = HashMap<Int, Int>()
+            for (pair in pts) {
+                if (pair.size < 2) continue
+                val t = pair[0]
+                val v = pair[1]
+                if (v <= 0 || !t.isFinite() || !v.isFinite()) continue
+                val f = (t - start) / span
+                if (f < -1e-9 || f > 1 + 1e-9) continue
+                val clamped = min(max(f, 0.0), 1.0)
+                val idx = min(((clamped + 1e-9) * stages.size).toInt(), stages.size - 1)
+                val s = stages[idx]
+                sum[s] = (sum[s] ?: 0.0) + v
+                cnt[s] = (cnt[s] ?: 0) + 1
+            }
+            return cnt.mapValues { (k, n) -> rnd(sum.getValue(k) / n) }
+        }
+        val h = means(hrTimed)
+        val v = means(hrvTimed)
+        return StageAutonomic(
+            hrvDeep = v[1], hrvLight = v[2], hrvRem = v[3],
+            hrDeep = h[1], hrLight = h[2], hrRem = h[3],
+        )
+    }
+
+    /**
+     * Legacy fallback when `series_t` is unavailable: mean of each stage's samples,
+     * mapping series index → stage by fraction of the night.
      * A single overnight HRV slope is intentionally not derived — nocturnal HRV is
      * stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery.
      */
@@ -148,7 +213,8 @@ object Sleep {
 
     fun metrics(stages: List<Int>, inBedS: Double): SleepMetrics? {
         val n = stages.size
-        if (n == 0) return null
+        // Unknown (0) epochs would silently count as awake; refuse like Swift and Rust.
+        if (n == 0 || inBedS <= 0 || !fullyStaged(stages)) return null
         val epochMin = inBedS / 60.0 / n
         if (epochMin <= 0) return null
         val isSleep = { c: Int -> c in 1..3 }
@@ -199,7 +265,7 @@ object Sleep {
     /** Asleep seconds for a night from its (smoothed) stages. */
     fun asleepS(stages: List<Int>, inBedS: Double): Int {
         val n = stages.size
-        if (n == 0) return 0
+        if (n == 0 || !fullyStaged(stages)) return 0
         val epochS = inBedS / n
         return (stages.count { it in 1..3 } * epochS).toInt()
     }
@@ -213,13 +279,22 @@ object Sleep {
 fun Summary.stagedSleepDebt(): SleepDebtSummary? {
     val defaultNeedS = 8.0 * 3600.0
     val byDay = HashMap<String, Double>()
+    // A wake day with ANY partially staged night is left out entirely rather than
+    // under-counted (its unknown epochs aren't sleep we can vouch for). Same as iOS.
+    val incompleteDays = HashSet<String>()
     for (n in nights) {
-        val st = n.stages ?: continue
-        if (st.size <= 1) continue
         val day = wakeYmd(n) ?: continue
-        val actual = Sleep.asleepS(Sleep.smooth(st, 5), (n.inBedH ?: 0.0) * 3600).toDouble()
+        // hasHypnogram (> 1 epoch) on top of iOS's rule: a one-epoch "hypnogram" stretched
+        // over a whole night isn't staging. Real ones have hundreds of epochs, so the two
+        // clients agree on every actual night.
+        if (!n.hasHypnogram || !n.stagingComplete) {
+            incompleteDays.add(day)
+            continue
+        }
+        val actual = Sleep.asleepS(Sleep.smooth(n.hypnogram ?: emptyList(), 5), n.durationS).toDouble()
         if (actual > 0) byDay[day] = (byDay[day] ?: 0.0) + actual
     }
+    byDay.keys.removeAll(incompleteDays)
     val anchor = byDay.keys.maxOrNull() ?: return null
     val anchorDate = try {
         LocalDate.parse(anchor)

@@ -135,4 +135,18 @@ class DayPairingTest {
         assertEquals(1, day.size)
         assertEquals("walk", day[0].label)
     }
+
+    @Test
+    fun `the core's wake_ymd wins over clock-string inference`() {
+        // A 03:00–05:00 sleep has end > start, so inference would say the onset day. The
+        // core knows the true wall-clock end and says otherwise.
+        val n = night("2026-03-01", "03:00", "05:00").copy(wakeYmd = "2026-03-02")
+        assertEquals("2026-03-02", Summary(nights = listOf(n)).wakeYmd(n))
+    }
+
+    @Test
+    fun `older cached summaries without wake_ymd still infer it`() {
+        val n = night("2026-03-01", "23:00", "07:00")
+        assertEquals("2026-03-02", Summary(nights = listOf(n)).wakeYmd(n))
+    }
 }

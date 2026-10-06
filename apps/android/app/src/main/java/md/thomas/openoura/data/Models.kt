@@ -3,6 +3,9 @@ package md.thomas.openoura.data
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
@@ -57,6 +60,62 @@ data class NightSeries(
     val temp: List<Double> = emptyList(),
     @SerialName("temp_span") val tempSpan: List<Double>? = null,
     val motion: List<Double> = emptyList(),
+    @SerialName("motion_time") val motionTime: List<Double>? = null,
+)
+
+/** Timestamped `[unix_s, value]` pairs per signal (`series_t`), gaps kept. */
+@Serializable
+data class NightTimedSeries(
+    val hr: List<List<Double>> = emptyList(),
+    val hrv: List<List<Double>> = emptyList(),
+    val spo2: List<List<Double>> = emptyList(),
+    val temp: List<List<Double>> = emptyList(),
+    val motion: List<List<Double>> = emptyList(),
+)
+
+/** Mean HR/HRV per sleep stage, as computed by the shared core (`nights[].autonomic`). */
+@Serializable
+data class StageAutonomicJson(
+    @SerialName("hrv_deep") val hrvDeep: Double? = null,
+    @SerialName("hrv_light") val hrvLight: Double? = null,
+    @SerialName("hrv_rem") val hrvRem: Double? = null,
+    @SerialName("hr_deep") val hrDeep: Double? = null,
+    @SerialName("hr_light") val hrLight: Double? = null,
+    @SerialName("hr_rem") val hrRem: Double? = null,
+)
+
+/** One component of the literature-based sleep score, with the paper behind it. */
+@Serializable
+data class SleepScoreComponent(
+    val key: String,
+    val score: Double,
+    val weight: Double,
+    val detail: JsonObject? = null,
+) {
+    val label: String
+        get() = when (key) {
+            "duration" -> "duration"
+            "efficiency" -> "efficiency"
+            "onset_latency" -> "time to fall asleep"
+            "waso" -> "awake during the night"
+            "awakenings" -> "awakenings"
+            "architecture" -> "stage balance"
+            "physiology" -> "heart & HRV"
+            else -> key
+        }
+
+    val source: String? get() = (detail?.get("source") as? JsonPrimitive)?.contentOrNull
+}
+
+/**
+ * A sleep score computed from published norms rather than from Oura's model — every
+ * threshold in it traces to a paper. See `oura-summary/src/sleep_score.rs`.
+ */
+@Serializable
+data class SleepScore(
+    val score: Double,
+    val components: List<SleepScoreComponent> = emptyList(),
+    val basis: String? = null,
 )
 
 @Serializable
@@ -68,8 +127,18 @@ data class NightRow(
     @SerialName("raw_start_ds") val rawStartDs: Long? = null,
     @SerialName("raw_end_ds") val rawEndDs: Long? = null,
     @SerialName("bedtime_adjusted") val bedtimeAdjusted: Boolean? = null,
+    @SerialName("bedtime_manual") val bedtimeManual: Boolean? = null,
+    @SerialName("raw_start") val rawStart: String? = null,
+    @SerialName("raw_end") val rawEnd: String? = null,
     val start: String? = null,
     val end: String? = null,
+    // Supplied by the shared brain: the morning you woke (the day the night belongs to),
+    // absolute bounds, and how the ring clock was tied to wall time for this night.
+    @SerialName("wake_ymd") val wakeYmd: String? = null,
+    @SerialName("start_unix") val startUnix: Long? = null,
+    @SerialName("end_unix") val endUnix: Long? = null,
+    @SerialName("clock_source") val clockSource: String? = null,
+    @SerialName("captured_unix") val capturedUnix: Long? = null,
     @SerialName("in_bed_h") val inBedH: Double? = null,
     @SerialName("hrv_ms") val hrvMs: Double? = null,
     val rhr: Double? = null,
@@ -82,11 +151,49 @@ data class NightRow(
     @SerialName("rem_pct") val remPct: Double? = null,
     @SerialName("wake_pct") val wakePct: Double? = null,
     val efficiency: Double? = null,
+    /** A ≤120-cell PREVIEW for compact charts — never compute metrics from it. */
     val stages: List<Int>? = null,
+    /** The full-resolution hypnogram (one code per 30 s epoch; 0 = not staged). */
+    @SerialName("stages_full") val stagesFull: List<Int>? = null,
+    @SerialName("staging_source") val stagingSource: String? = null,
+    @SerialName("staging_coverage_pct") val stagingCoveragePct: Double? = null,
+    @SerialName("staging_complete") val stagingCompleteJson: Boolean? = null,
     val series: NightSeries? = null,
+    @SerialName("series_t") val seriesT: NightTimedSeries? = null,
+    val autonomic: StageAutonomicJson? = null,
+    /** Nightly respiratory rate (breaths/min), the ring's own per-window estimate. */
+    @SerialName("breath_rate") val breathRate: Double? = null,
+    @SerialName("sleep_score") val sleepScore: SleepScore? = null,
 ) {
     val id: String get() = (date ?: "") + (start ?: "")
-    val hasHypnogram: Boolean get() = (stages?.size ?: 0) > 1
+
+    /** The hypnogram to use: full resolution when present, the preview only as a fallback. */
+    val hypnogram: List<Int>? get() = stagesFull ?: stages
+    val hasHypnogram: Boolean get() = (hypnogram?.size ?: 0) > 1
+
+    /**
+     * Every epoch carries a real stage (1–4). A partially staged night (code 0 epochs)
+     * must not feed sleep metrics or debt — the unknown epochs would count as awake.
+     */
+    val stagingComplete: Boolean
+        get() = stagingCompleteJson ?: (hypnogram?.let { h -> h.isNotEmpty() && h.all { it in 1..4 } } ?: false)
+
+    /** Seconds in bed: exact wall-clock bounds when the core supplied them. */
+    val durationS: Double
+        get() {
+            val s = startUnix
+            val e = endUnix
+            return if (s != null && e != null) (e - s).toDouble() else (inBedH ?: 0.0) * 3600
+        }
+
+    val isBedtimeManual: Boolean get() = bedtimeManual ?: false
+
+    /** Key the on-device staging cache uses for this night (matches iOS `stagingKey`). */
+    val stagingKey: String get() = "${startDs ?: 0}:${startUnix ?: capturedUnix ?: 0}"
+
+    val hasSignals: Boolean
+        get() = !(seriesT?.hr.isNullOrEmpty()) || !(series?.hr.isNullOrEmpty()) ||
+            !(seriesT?.motion.isNullOrEmpty()) || !(series?.motion.isNullOrEmpty())
 }
 
 @Serializable
@@ -162,6 +269,55 @@ data class Device(
     val nights: Int? = null,
     val synced: String? = null,
     @SerialName("synced_hm") val syncedHm: String? = null,
+    @SerialName("elapsed_days") val elapsedDays: Double? = null,
+    @SerialName("observed_days") val observedDays: Int? = null,
+    @SerialName("observed_coverage_days") val observedCoverageDays: Double? = null,
+    @SerialName("total_events") val totalEvents: Int? = null,
+    @SerialName("raw_events") val rawEvents: Int? = null,
+    @SerialName("decoded_events") val decodedEvents: Int? = null,
+    /** `[unix_s, percent]` readings over the last 14 days. */
+    @SerialName("battery_history") val batteryHistory: List<List<Double>> = emptyList(),
+)
+
+/** Per-boot ring clock diagnostics from the shared brain (`clock` in the summary JSON). */
+@Serializable
+data class ClockEpoch(
+    @SerialName("min_ds") val minDs: Long? = null,
+    @SerialName("max_ds") val maxDs: Long? = null,
+    @SerialName("span_h") val spanH: Double? = null,
+    @SerialName("capture_min") val captureMin: Long? = null,
+    @SerialName("capture_max") val captureMax: Long? = null,
+    val anchors: Int? = null,
+    @SerialName("anchor_sources") val anchorSources: List<String>? = null,
+    @SerialName("latest_anchor_unix") val latestAnchorUnix: Long? = null,
+)
+
+@Serializable
+data class UndatedReason(
+    val reason: String? = null,
+    val count: Int? = null,
+    val recoverable: Boolean? = null,
+    val message: String? = null,
+    @SerialName("span_h") val spanH: Double? = null,
+)
+
+@Serializable
+data class UndatedNight(
+    @SerialName("start_ds") val startDs: Long? = null,
+    @SerialName("end_ds") val endDs: Long? = null,
+    @SerialName("in_bed_h") val inBedH: Double? = null,
+    @SerialName("captured_unix") val capturedUnix: Long? = null,
+    val source: String? = null,
+    val reason: String? = null,
+    val recoverable: Boolean? = null,
+)
+
+@Serializable
+data class ClockDiag(
+    val epochs: List<ClockEpoch> = emptyList(),
+    val warnings: List<String> = emptyList(),
+    @SerialName("undated_reasons") val undatedReasons: List<UndatedReason>? = null,
+    @SerialName("undated_nights") val undatedNights: List<UndatedNight> = emptyList(),
 )
 
 /**
@@ -174,7 +330,7 @@ data class IllnessBiomarker(
     val value: Double,
     val lower: Double,
     val upper: Double,
-    val indicatesSymptoms: Boolean,
+    val indicatesSymptoms: Boolean = false,
     val reason: String? = null, // "ELEVATED" | "DECREASED" | null
 ) {
     val id: String get() = type
@@ -182,14 +338,14 @@ data class IllnessBiomarker(
 
 @Serializable
 data class IllnessResult(
-    val available: Boolean,
-    val status: String,       // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS | MISSING_LAST_NIGHT_SLEEP | MISSING_SLEEP_DATA
-    val trafficLight: String, // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS
-    val score: Double,
-    val decision: Int,
-    val date: String,
-    val daysWithData: Int,
-    val biomarkers: List<IllnessBiomarker>,
+    val available: Boolean = false,
+    val status: String = "MISSING_SLEEP_DATA", // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS | MISSING_LAST_NIGHT_SLEEP | MISSING_SLEEP_DATA
+    val trafficLight: String = "NO_SIGNS",     // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS
+    val score: Double = 0.0,
+    val decision: Int = 0,
+    val date: String = "",
+    val daysWithData: Int = 0,
+    val biomarkers: List<IllnessBiomarker> = emptyList(),
 )
 
 @Serializable
@@ -197,6 +353,7 @@ data class Summary(
     val digest: String? = null,
     val device: Device? = null,
     val nights: List<NightRow> = emptyList(),
+    val clock: ClockDiag? = null,
     val vitals: Vitals = Vitals(),
     /** date → 96 × 15-min mean MET-above-rest */
     @SerialName("activity_profile") val activityProfile: Map<String, List<Double>> = emptyMap(),
@@ -210,9 +367,21 @@ data class Summary(
     // Filled on-device, not present in the FFI JSON. They round-trip through the local
     // summary cache, which is why they are @Serializable rather than excluded outright.
     val illness: IllnessResult? = null,
+    /**
+     * Model-free Symptom Radar from the shared core — same biomarkers, same shape, judged
+     * against your own baseline. Used when the on-device model is not present.
+     */
+    val symptoms: IllnessResult? = null,
     val workouts: List<WorkoutSession> = emptyList(),
     val modelErrors: List<String> = emptyList(),
 ) {
+    /**
+     * Whichever Symptom Radar this build has: the on-device model when it ran, the shared
+     * core's baseline comparison otherwise. Same rule as iOS `Summary.symptomRadar`.
+     */
+    val symptomRadar: IllnessResult?
+        get() = illness?.takeIf { it.available } ?: symptoms
+
     /** recent days (newest first) that have a movement profile. */
     val activeDays: List<String> get() = activityProfile.keys.sortedDescending()
 
@@ -222,8 +391,12 @@ data class Summary(
      * next day's morning. Pairing a day with the sleep you woke from — not the sleep you
      * started that evening — is what makes "night + activity of the day" one coherent
      * day. Kept identical to the web dashboard's wakeYmd() and Swift's Summary.wakeYmd.
+     *
+     * The shared core now supplies `wake_ymd` (from the true wall-clock end); the clock
+     * string inference below only serves older cached summaries that predate it.
      */
     fun wakeYmd(n: NightRow): String? {
+        n.wakeYmd?.let { return it }
         val ymd = n.ymd ?: return null
         val s = n.start
         val e = n.end

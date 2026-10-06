@@ -103,14 +103,14 @@ object HealthExport {
         val records = ArrayList<androidx.health.connect.client.records.Record>()
 
         for (night in summary.nights) {
-            val start = night.startUnix() ?: continue
-            val end = night.endUnix() ?: continue
+            val start = night.exportStartUnix() ?: continue
+            val end = night.exportEndUnix() ?: continue
             if (end <= start) continue
             val id = "openoura.sleep.${night.startDs ?: start}"
 
-            // One in-bed session per night, with the hypnogram as its stages when the
-            // on-device model produced one.
-            val stages = night.stages?.takeIf { it.size > 1 }?.let { codes ->
+            // One in-bed session per night, with the full hypnogram (the ring's own, or the
+            // on-device model's) as its stages — never the 120-cell preview.
+            val stages = night.hypnogram?.takeIf { it.size > 1 }?.let { codes ->
                 runLengthStages(codes, start, end)
             } ?: emptyList()
 
@@ -264,7 +264,7 @@ object HealthExport {
     internal fun fingerprint(s: Summary): String = buildString {
         append(s.nights.size).append('|')
         append(s.nights.lastOrNull()?.startDs ?: 0).append('|')
-        append(s.nights.count { (it.stages?.size ?: 0) > 1 }).append('|')
+        append(s.nights.count { it.hasHypnogram }).append('|')
         append(s.activityDaily.size).append('|')
         append(s.workouts.size).append('|')
         append(s.activityDaily.keys.maxOrNull() ?: "")
@@ -276,9 +276,12 @@ object HealthExport {
  * midnight when `end < start`. Health Connect wants absolute instants, so resolve them in
  * the phone's own zone — the same zone whose offset was handed to `build_summary`.
  */
-private fun md.thomas.openoura.data.NightRow.startUnix(): Long? = localUnix(ymd, start)
+// Exact wall-clock bounds from the shared core when present; the clock-string inference
+// only serves cached summaries from before `start_unix`/`end_unix` existed.
+private fun md.thomas.openoura.data.NightRow.exportStartUnix(): Long? = startUnix ?: localUnix(ymd, start)
 
-private fun md.thomas.openoura.data.NightRow.endUnix(): Long? {
+private fun md.thomas.openoura.data.NightRow.exportEndUnix(): Long? {
+    endUnix?.let { return it }
     val s = start ?: return null
     val e = end ?: return null
     val base = localUnix(ymd, e) ?: return null
@@ -317,6 +320,11 @@ private fun runLengthStages(
     var i = 0
     while (i < codes.size) {
         val code = codes[i]
+        // 0 = not staged: export nothing for it rather than inventing "awake" (same as iOS).
+        if (code !in 1..4) {
+            i++
+            continue
+        }
         var j = i
         while (j < codes.size && codes[j] == code) j++
         out.add(

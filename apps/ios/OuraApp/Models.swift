@@ -218,8 +218,14 @@ struct ClockEpoch: Codable {
 struct ClockDiag: Codable {
     var epochs: [ClockEpoch] = []
     var warnings: [String] = []
-    var undated_reasons: [String: Int]? = nil
+    // An array of objects in the core (`{reason, count, recoverable, message, span_h?}`).
+    // Declared as a dictionary, a single undated night made the whole Summary fail to decode.
+    var undated_reasons: [UndatedReason]? = nil
     var undated_nights: [UndatedNight] = []
+}
+struct UndatedReason: Codable {
+    var reason: String?; var count: Int?; var recoverable: Bool?
+    var message: String?; var span_h: Double?
 }
 struct UndatedNight: Codable {
     var start_ds: Int64?; var end_ds: Int64?; var in_bed_h: Double?

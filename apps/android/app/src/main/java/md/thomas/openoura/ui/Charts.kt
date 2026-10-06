@@ -156,6 +156,8 @@ fun Hypnogram(stages: List<Int>, height: Dp = 40.dp, modifier: Modifier = Modifi
         if (stages.isEmpty()) return@Canvas
         val w = size.width / stages.size
         stages.forEachIndexed { i, s ->
+            // 0 = not staged: leave a gap rather than drawing it as awake (same as iOS).
+            if (s !in 1..4) return@forEachIndexed
             val frac = when (s) {
                 1 -> 1.0f
                 2 -> 0.72f

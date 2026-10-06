@@ -4,9 +4,22 @@ import md.thomas.openoura.store.isValidRingKey
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
+import java.util.Locale
 
 class RingSyncFormatTest {
+
+    // The formatters follow the device locale ("1,0 MB" on an Italian phone is correct),
+    // so pin one here instead of letting the developer's machine decide the expectations.
+    private val savedLocale = Locale.getDefault()
+
+    @Before
+    fun pinLocale() = Locale.setDefault(Locale.US)
+
+    @After
+    fun restoreLocale() = Locale.setDefault(savedLocale)
 
     @Test
     fun `auth rejections are recognised so they are not retried`() {

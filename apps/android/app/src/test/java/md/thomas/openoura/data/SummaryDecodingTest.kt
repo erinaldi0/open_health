@@ -90,4 +90,48 @@ class SummaryDecodingTest {
         assertTrue(s.error!!.startsWith("no decoded events"))
         assertTrue(s.nights.isEmpty())
     }
+
+    @Test
+    fun `decodes the fields added by the merged core`() {
+        val s = SummaryJson.decodeFromString(
+            Summary.serializer(),
+            """
+            {"nights":[{"ymd":"2026-03-01","wake_ymd":"2026-03-02","start_unix":100,"end_unix":200,
+              "stages":[2,2],"stages_full":[2,2,3,0],"staging_complete":false,"staging_source":"ring",
+              "series_t":{"hr":[[110,55.0],[150,57.5]],"hrv":[],"spo2":[],"temp":[],"motion":[]},
+              "autonomic":{"hr_deep":52,"hrv_deep":61},"breath_rate":14.2,
+              "sleep_score":{"score":78,"basis":"literature","components":[
+                {"key":"onset_latency","score":90,"weight":0.1,"detail":{"source":"Ohayon 2017","value":12}}]}}],
+             "clock":{"epochs":[{"min_ds":1,"max_ds":9,"anchors":2,"anchor_sources":["phone"]}],
+               "warnings":["1 night could not be dated"],
+               "undated_reasons":[{"reason":"missing_anchor","count":1,"recoverable":true,"message":"…"}],
+               "undated_nights":[{"start_ds":5,"in_bed_h":7.5,"reason":"missing_anchor"}]},
+             "symptoms":{"available":true,"status":"NO_SIGNS","trafficLight":"NO_SIGNS","score":0.1,
+               "decision":0,"date":"2026-03-02","daysWithData":12,"biomarkers":[]},
+             "device":{"battery_history":[[100,80],[200,79]],"raw_events":10,"decoded_events":9,"observed_days":3}}
+            """.trimIndent()
+        )
+        val n = s.nights.single()
+        assertEquals(listOf(2, 2, 3, 0), n.hypnogram) // full beats the preview
+        assertTrue(!n.stagingComplete)
+        assertEquals(100.0, n.durationS, 1e-9)
+        assertEquals("2026-03-02", s.wakeYmd(n))
+        assertEquals(2, n.seriesT!!.hr.size)
+        assertEquals(78.0, n.sleepScore!!.score, 1e-9)
+        assertEquals("time to fall asleep", n.sleepScore!!.components.single().label)
+        assertEquals("Ohayon 2017", n.sleepScore!!.components.single().source)
+        // A list, not a map — the shape that made iOS fail the whole decode.
+        assertEquals("missing_anchor", s.clock!!.undatedReasons!!.single().reason)
+        assertEquals(1, s.clock!!.undatedNights.size)
+        assertEquals("NO_SIGNS", s.symptomRadar!!.status) // no on-device model → core's radar
+        assertEquals(2, s.device!!.batteryHistory.size)
+    }
+
+    @Test
+    fun `the on-device Symptom Radar wins when it ran`() {
+        val core = IllnessResult(available = true, status = "NO_SIGNS")
+        val model = IllnessResult(available = true, status = "MINOR_SIGNS")
+        assertEquals("MINOR_SIGNS", Summary(illness = model, symptoms = core).symptomRadar!!.status)
+        assertEquals("NO_SIGNS", Summary(illness = model.copy(available = false), symptoms = core).symptomRadar!!.status)
+    }
 }
