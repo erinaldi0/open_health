@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import md.thomas.openoura.data.NightRow
 import md.thomas.openoura.data.Sleep
+import md.thomas.openoura.data.SleepScore
 import md.thomas.openoura.data.Summary
 import md.thomas.openoura.data.WakingActivityTimeline
 import md.thomas.openoura.data.clockLabel
@@ -145,7 +147,20 @@ fun SleepReport(s: Summary, night: NightRow, modifier: Modifier = Modifier) {
             )
         )
 
+        night.sleepScore?.let { score ->
+            Rule("sleep score")
+            SleepScoreCard(score, night.breathRate)
+        }
+
         if (smoothed != null) {
+            if (!night.stagingComplete) {
+                Text(
+                    "Incomplete sleep analysis. Gaps mean no data, not awake time; sleep metrics are withheld.",
+                    fontFamily = Obs.prose,
+                    fontSize = 13.sp,
+                    color = colors.bad,
+                )
+            }
             Rule("polysomnograph")
             Polysomnograph(night)
             StageLegend()
@@ -159,13 +174,13 @@ fun SleepReport(s: Summary, night: NightRow, modifier: Modifier = Modifier) {
                 )
             )
         } else {
-            // The model-free (`lite`) build has no hypnogram — say so rather than
-            // rendering an empty chart frame.
+            // No hypnogram for this night (neither the ring's nor the on-device model's) —
+            // say so rather than rendering an empty chart frame.
             EmptyNote(
-                "Sleep staging needs the on-device model build. The raw signals below still " +
-                    "come from the shared core."
+                "No sleep stages for this night. The raw signals below still come from the " +
+                    "shared core."
             )
-            night.series?.let { if (it.hr.size > 1) Polysomnograph(night) }
+            if (night.hasSignals) Polysomnograph(night)
         }
 
         metrics?.let { m ->
@@ -396,4 +411,62 @@ internal fun sleepInterpretation(night: NightRow, m: md.thomas.openoura.data.Sle
         if (it <= 40) out.add("REM was concentrated in the second half, the normal pattern.")
     }
     return out
+}
+
+/**
+ * The literature-based sleep score: total, then each component's bar (width = score,
+ * opacity = how much it counted) with its source paper on demand. Mirrors iOS
+ * `SleepScoreCard` (Reports.swift); computed in `oura-summary/src/sleep_score.rs`.
+ */
+@Composable
+fun SleepScoreCard(score: SleepScore, breathRate: Double?, modifier: Modifier = Modifier) {
+    val colors = Obs.colors
+    var expanded by rememberSaveable { mutableStateOf(false) }
+    val tint = when {
+        score.score >= 85 -> colors.good
+        score.score >= 70 -> colors.chart
+        else -> colors.bad
+    }
+    Column(modifier.fillMaxWidth().obsCard(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("${score.score.toInt()}", fontFamily = Obs.mono, fontSize = 38.sp, fontWeight = FontWeight.Medium, color = tint)
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text("/ 100", fontFamily = Obs.mono, fontSize = 12.sp, color = colors.ink2)
+                Text(score.basis ?: "published norms", fontFamily = Obs.mono, fontSize = 9.sp, color = colors.muted)
+            }
+            breathRate?.let { br ->
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("%.1f".format(br), fontFamily = Obs.mono, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = colors.ink)
+                    Text("br/min", fontFamily = Obs.mono, fontSize = 9.sp, color = colors.muted)
+                }
+            }
+        }
+        for (c in score.components) {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Row(Modifier.fillMaxWidth()) {
+                    Text(c.label, fontFamily = Obs.mono, fontSize = 11.sp, color = colors.ink2, modifier = Modifier.weight(1f))
+                    Text("${c.score.toInt()}", fontFamily = Obs.mono, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = colors.ink)
+                }
+                Box(Modifier.fillMaxWidth().height(3.dp).background(colors.rule)) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth((c.score / 100).toFloat().coerceIn(0f, 1f))
+                            .height(3.dp)
+                            .background(colors.chart.copy(alpha = (0.35 + 0.65 * minOf(1.0, c.weight * 3)).toFloat()))
+                    )
+                }
+                if (expanded) {
+                    c.source?.let { Text(it, fontFamily = Obs.mono, fontSize = 9.sp, color = colors.muted) }
+                }
+            }
+        }
+        Text(
+            if (expanded) "hide sources" else "show sources",
+            fontFamily = Obs.mono,
+            fontSize = 10.sp,
+            color = colors.ink2,
+            modifier = Modifier.clickable { expanded = !expanded },
+        )
+    }
 }

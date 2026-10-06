@@ -9,20 +9,29 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import md.thomas.openoura.data.Cardio
 import md.thomas.openoura.data.Fitness
+import md.thomas.openoura.data.IllnessBiomarker
 import md.thomas.openoura.data.IllnessResult
+import md.thomas.openoura.data.rnd
 import md.thomas.openoura.data.SleepDebtSummary
 import md.thomas.openoura.data.Summary
 import kotlin.math.abs
@@ -164,43 +173,128 @@ fun SleepDebtCard(debt: SleepDebtSummary, onOpen: () -> Unit, modifier: Modifier
     }
 }
 
-/** Symptom Radar — the on-device illness detection readout. */
+/**
+ * Symptom Radar — overnight biometrics against your own baseline. Shows the on-device
+ * model's result when it ran, else the shared core's model-free comparison
+ * (`Summary.symptomRadar`). Status + explanation first; "View details" reveals the
+ * measurements with their personal ranges. Mirrors iOS `IllnessCard` (Reports.swift).
+ */
 @Composable
 fun IllnessCard(illness: IllnessResult, modifier: Modifier = Modifier) {
     val colors = Obs.colors
-    val tone = when (illness.trafficLight) {
-        "MAJOR_SIGNS" -> colors.alert
+    var showDetails by rememberSaveable(illness.date, illness.status) { mutableStateOf(false) }
+    val tint = when (illness.trafficLight) {
+        "NO_SIGNS" -> colors.good
         "MINOR_SIGNS" -> colors.bad
-        else -> colors.good
+        "MAJOR_SIGNS" -> colors.alert
+        else -> colors.muted
     }
     Column(modifier.fillMaxWidth().obsCard(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            ObsTag("symptom radar")
-            Spacer(Modifier.weight(1f))
-            Box(Modifier.size(8.dp).background(tone, CircleShape))
-        }
-        Text(illnessCopy(illness), fontFamily = Obs.prose, fontSize = 14.sp, color = colors.ink)
-        if (!illness.available) return@Column
-        for (b in illness.biomarkers) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(
-                        biomarkerName(b.type),
-                        fontFamily = Obs.mono,
-                        fontSize = 11.sp,
-                        color = colors.ink2,
-                    )
-                    Text(
-                        "%.1f".format(b.value) + (b.reason?.let { " · ${it.lowercase()}" } ?: ""),
-                        fontFamily = Obs.mono,
-                        fontSize = 11.sp,
-                        color = if (b.indicatesSymptoms) colors.bad else colors.ink2,
-                    )
-                }
-                RangeTrack(b.value, b.lower, b.upper, b.indicatesSymptoms)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Rule("symptom radar", Modifier.weight(1f))
+            if (illness.date.isNotEmpty()) {
+                Spacer(Modifier.width(12.dp))
+                Text(illness.date, fontFamily = Obs.mono, fontSize = 10.sp, color = colors.ink2)
             }
         }
+        Text(
+            if (illness.available) illnessStatus(illness) else "Getting to know you",
+            fontFamily = Obs.mono,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Medium,
+            color = if (illness.available) tint else colors.ink2,
+        )
+        Text(illnessCopy(illness), fontFamily = Obs.prose, fontSize = 14.sp, color = colors.ink2)
+        if (!illness.available) return@Column
+
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 32.dp)
+                .clickable { showDetails = !showDetails }
+                .semantics { stateDescription = if (showDetails) "Expanded" else "Collapsed" },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (showDetails) "Hide details" else "View details",
+                fontFamily = Obs.mono,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = colors.ink,
+                modifier = Modifier.weight(1f),
+            )
+            Text(if (showDetails) "▴" else "▾", fontSize = 12.sp, color = colors.ink)
+        }
+        if (!showDetails) return@Column
+
+        Box(Modifier.fillMaxWidth().height(1.dp).background(colors.rule))
+        Text("Overnight measurements", fontFamily = Obs.prose, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = colors.ink)
+        for (type in BIOMARKER_ORDER) {
+            illness.biomarkers.firstOrNull { it.type == type }?.let { BiomarkerRow(it) }
+        }
+        if (illness.biomarkers.isEmpty()) {
+            Text("Measurement details aren't available for this result.", fontFamily = Obs.prose, fontSize = 13.sp, color = colors.muted)
+        }
+        Text("Based on ${illness.daysWithData} nights in the past 30 days", fontFamily = Obs.prose, fontSize = 12.sp, color = colors.muted)
     }
+}
+
+private val BIOMARKER_ORDER = listOf("AverageBreath", "LowestHeartRate", "AverageHrv", "TemperatureDeviation")
+
+private fun biomarkerUnit(type: String): String = when (type) {
+    "AverageBreath" -> "br/min"
+    "LowestHeartRate" -> "bpm"
+    "AverageHrv" -> "ms"
+    "TemperatureDeviation" -> "°C"
+    else -> ""
+}
+
+@Composable
+private fun BiomarkerRow(b: IllnessBiomarker) {
+    val colors = Obs.colors
+    val unit = biomarkerUnit(b.type)
+    fun fmt(v: Double): String = when {
+        !v.isFinite() -> "–"
+        unit == "°C" -> "%.1f".format(v)
+        v == rnd(v) -> "%.0f".format(v)
+        else -> "%.1f".format(v)
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(biomarkerName(b.type), fontFamily = Obs.prose, fontSize = 14.sp, color = colors.ink2, modifier = Modifier.weight(1f))
+            Text(
+                "${fmt(b.value)} $unit",
+                fontFamily = Obs.mono,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (b.indicatesSymptoms) colors.alert else colors.ink,
+            )
+        }
+        if (b.indicatesSymptoms) {
+            Text(
+                when (b.reason) {
+                    "ELEVATED" -> "Above usual"
+                    "DECREASED" -> "Below usual"
+                    else -> "Outside usual range"
+                },
+                fontFamily = Obs.prose, fontSize = 12.sp, color = colors.alert,
+            )
+        }
+        Text(
+            if (b.lower.isFinite() && b.upper.isFinite() && b.lower <= b.upper)
+                "Personal range: ${fmt(b.lower)} to ${fmt(b.upper)} $unit"
+            else "Personal range unavailable",
+            fontFamily = Obs.prose, fontSize = 12.sp, color = colors.muted,
+        )
+        RangeTrack(b.value, b.lower, b.upper, b.indicatesSymptoms)
+    }
+}
+
+internal fun illnessStatus(illness: IllnessResult): String = when (illness.trafficLight) {
+    "NO_SIGNS" -> "No signs"
+    "MINOR_SIGNS" -> "Minor signs"
+    "MAJOR_SIGNS" -> "Major signs"
+    else -> "No result yet"
 }
 
 @Composable
@@ -236,17 +330,23 @@ internal fun debtStateCopy(state: String): String = when (state) {
 }
 
 internal fun illnessCopy(illness: IllnessResult): String = when (illness.status) {
-    "MAJOR_SIGNS" -> "Several biomarkers are outside your normal range."
-    "MINOR_SIGNS" -> "A biomarker or two is drifting from your normal range."
-    "NO_SIGNS" -> "Nothing unusual in last night's biomarkers."
-    "MISSING_LAST_NIGHT_SLEEP" -> "No sleep recorded last night, so there is nothing to compare."
-    else -> "Not enough recent nights to establish your normal range yet."
+    // The decision comes from the model's overall score, not a count of flags: a night can
+    // have a biometric out of range and still not add up to strain. Same copy as iOS/web.
+    "NO_SIGNS" -> when (val flagged = illness.biomarkers.count { it.indicatesSymptoms }) {
+        0 -> "Your overnight biometrics are within their usual ranges."
+        1 -> "One overnight biometric is outside your usual range, but together they don't match the pattern of your body fighting something."
+        else -> "$flagged overnight biometrics are outside your usual range, but together they don't match the pattern of your body fighting something."
+    }
+    "MINOR_SIGNS" -> "Some overnight biometrics are outside your usual ranges."
+    "MAJOR_SIGNS" -> "Several overnight biometrics are outside your usual ranges."
+    "MISSING_LAST_NIGHT_SLEEP" -> "Wear your ring overnight, then sync to see your latest result."
+    else -> "Your radar needs at least 7 nights of data from the last 14 days."
 }
 
 internal fun biomarkerName(type: String): String = when (type) {
-    "AverageBreath" -> "respiratory rate"
-    "LowestHeartRate" -> "lowest heart rate"
-    "AverageHrv" -> "hrv"
-    "TemperatureDeviation" -> "skin temp deviation"
+    "AverageBreath" -> "Breathing rate"
+    "LowestHeartRate" -> "Lowest heart rate"
+    "AverageHrv" -> "Heart rate variability"
+    "TemperatureDeviation" -> "Temperature change"
     else -> type
 }

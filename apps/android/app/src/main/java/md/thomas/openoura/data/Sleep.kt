@@ -54,7 +54,56 @@ data class StageAutonomic(
         get() = listOf(hrvDeep, hrvLight, hrvRem, hrDeep, hrLight, hrRem).any { it != null }
 }
 
+/** One `series_t` sample placed on the night window: [fraction] 0..1 of the in-bed span. */
+data class TimedSample(val unix: Double, val fraction: Double, val value: Double)
+
 object Sleep {
+
+    /**
+     * Longest unobserved gap (s) a continuous signal line bridges; longer gaps break the line
+     * and its fill. Same value as iOS `Sleep.laneGapSeconds` and `LANE_GAP_S` in app.js.
+     */
+    const val LANE_GAP_S: Double = 15 * 60.0
+
+    /** `[[unix_s, value]]` pairs → samples on the night window; out-of-window points dropped. */
+    fun timedSamples(raw: List<List<Double>>?, startUnix: Long?, endUnix: Long?): List<TimedSample>? {
+        if (raw.isNullOrEmpty() || startUnix == null || endUnix == null || endUnix <= startUnix) return null
+        val start = startUnix.toDouble()
+        val end = endUnix.toDouble()
+        val span = end - start
+        val out = raw.mapNotNull { pair ->
+            if (pair.size < 2) return@mapNotNull null
+            val t = pair[0]
+            val v = pair[1]
+            if (!t.isFinite() || !v.isFinite() || t < start - 1e-6 || t > end + 1e-6) return@mapNotNull null
+            TimedSample(t, min(max((t - start) / span, 0.0), 1.0), v)
+        }
+        return out.ifEmpty { null }
+    }
+
+    /** Split samples into runs separated by gaps longer than [maxGapS]. */
+    fun contiguousSegments(samples: List<TimedSample>, maxGapS: Double = LANE_GAP_S): List<List<TimedSample>> {
+        if (samples.isEmpty()) return emptyList()
+        val out = ArrayList<MutableList<TimedSample>>()
+        out.add(mutableListOf(samples[0]))
+        for (sample in samples.drop(1)) {
+            if (sample.unix - out.last().last().unix > maxGapS) out.add(mutableListOf(sample))
+            else out.last().add(sample)
+        }
+        return out
+    }
+
+    /** Value of the sample nearest [fraction] within [toleranceS], or null inside a gap. */
+    fun sampleAt(
+        fraction: Double,
+        samples: List<TimedSample>,
+        durationS: Double,
+        toleranceS: Double = LANE_GAP_S / 2,
+    ): Double? {
+        if (durationS <= 0 || samples.isEmpty()) return null
+        val nearest = samples.minByOrNull { abs(it.fraction - fraction) } ?: return null
+        return if (abs(nearest.fraction - fraction) * durationS <= toleranceS) nearest.value else null
+    }
 
     /** A hypnogram is usable for metrics only when every epoch is a real stage (1–4). */
     private fun fullyStaged(stages: List<Int>): Boolean = stages.all { it in 1..4 }

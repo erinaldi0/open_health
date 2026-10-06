@@ -31,6 +31,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import md.thomas.openoura.data.DatedVital
 import md.thomas.openoura.data.Profile
 import md.thomas.openoura.data.SleepDebtSummary
@@ -72,7 +74,21 @@ fun Sheet(title: String, onBack: () -> Unit, content: @Composable () -> Unit) {
     }
 }
 
-/** Every day, newest first — mini hypnogram plus steps/kcal, opening the full report. */
+/**
+ * Days grouped under "MONTH YYYY" headers, newest first, keeping the summary's own order.
+ * Mirrors iOS `AllDaysView.groups`; unparseable keys land under "undated".
+ */
+internal fun dayGroups(days: List<String>, locale: Locale = Locale.getDefault()): List<Pair<String, List<String>>> {
+    val month = DateTimeFormatter.ofPattern("MMMM yyyy", locale)
+    val out = ArrayList<Pair<String, MutableList<String>>>()
+    for (day in days) {
+        val title = runCatching { LocalDate.parse(day).format(month) }.getOrDefault("undated")
+        if (out.lastOrNull()?.first == title) out.last().second.add(day) else out.add(title to mutableListOf(day))
+    }
+    return out
+}
+
+/** Every day, newest first by month — mini hypnogram plus steps/kcal, opening the full report. */
 @Composable
 fun AllDaysScreen(s: Summary, onOpenDay: (String) -> Unit, onBack: () -> Unit) {
     val colors = Obs.colors
@@ -81,37 +97,58 @@ fun AllDaysScreen(s: Summary, onOpenDay: (String) -> Unit, onBack: () -> Unit) {
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 40.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            items(s.days.size) { index ->
-                val day = s.days[index]
-                val night = s.nightForDay(day)
-                val daily = s.activityDaily[day]
-                Column(
-                    Modifier.fillMaxWidth().obsCard().clickable { onOpenDay(day) },
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(day, fontFamily = Obs.mono, fontSize = 13.sp, color = colors.ink)
-                        Text(
-                            fmtHours(night?.inBedH),
-                            fontFamily = Obs.mono,
-                            fontSize = 13.sp,
-                            color = colors.ink2,
-                        )
-                    }
-                    night?.hypnogram?.takeIf { it.size > 1 }?.let { Hypnogram(it, height = 26.dp) }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                        Text(
-                            "${fmtSteps(daily?.steps)} steps",
-                            fontFamily = Obs.mono,
-                            fontSize = 11.sp,
-                            color = colors.muted,
-                        )
-                        Text(
-                            "${fmt(daily?.activeKcal)} kcal",
-                            fontFamily = Obs.mono,
-                            fontSize = 11.sp,
-                            color = colors.muted,
-                        )
+            for ((title, groupDays) in dayGroups(s.days)) {
+                item(key = "month-$title") {
+                    Text(
+                        title.uppercase(),
+                        modifier = Modifier.padding(top = 8.dp),
+                        fontFamily = Obs.mono,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.4.sp,
+                        color = colors.muted,
+                    )
+                }
+                items(groupDays.size, key = { groupDays[it] }) { index ->
+                    val day = groupDays[index]
+                    val night = s.nightForDay(day)
+                    val daily = s.activityDaily[day]
+                    Column(
+                        Modifier.fillMaxWidth().obsCard().clickable { onOpenDay(day) },
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            val weekday = runCatching {
+                                LocalDate.parse(day).format(DateTimeFormatter.ofPattern("EEE", Locale.getDefault()))
+                            }.getOrNull()
+                            Text(
+                                listOfNotNull(weekday, day).joinToString("  "),
+                                fontFamily = Obs.mono,
+                                fontSize = 13.sp,
+                                color = colors.ink,
+                            )
+                            Text(
+                                fmtHours(night?.inBedH),
+                                fontFamily = Obs.mono,
+                                fontSize = 13.sp,
+                                color = colors.ink2,
+                            )
+                        }
+                        night?.hypnogram?.takeIf { it.size > 1 }?.let { Hypnogram(it, height = 26.dp) }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Text(
+                                "${fmtSteps(daily?.steps)} steps",
+                                fontFamily = Obs.mono,
+                                fontSize = 11.sp,
+                                color = colors.muted,
+                            )
+                            Text(
+                                "${fmt(daily?.activeKcal)} kcal",
+                                fontFamily = Obs.mono,
+                                fontSize = 11.sp,
+                                color = colors.muted,
+                            )
+                        }
                     }
                 }
             }

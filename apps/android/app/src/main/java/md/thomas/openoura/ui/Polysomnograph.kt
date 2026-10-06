@@ -37,6 +37,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import md.thomas.openoura.data.NightRow
 import md.thomas.openoura.data.Sleep
+import md.thomas.openoura.data.TimedSample
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -52,7 +54,20 @@ private val HYP_H = 84.dp
 private val LANE_H = 44.dp
 private val AXIS_H = 18.dp
 
-private class SignalLane(val v: List<Double>, val color: Color, val dp: Int, val span: List<Double>)
+/**
+ * One signal lane. [timed] (from `series_t`) places each sample at its real time and keeps
+ * gaps; [times] (motion) draws stems at known fractions; otherwise [v] is spread evenly over
+ * [span] — only for cached summaries from before `series_t`.
+ */
+private class SignalLane(
+    val v: List<Double>,
+    val color: Color,
+    val dp: Int,
+    val span: List<Double>,
+    val times: List<Double>? = null,
+    val timed: List<TimedSample>? = null,
+    val durationS: Double = 0.0,
+)
 private class Lane(val label: String, val unit: String, val signal: SignalLane?, val stages: List<Int>?)
 
 @Composable
@@ -230,10 +245,52 @@ private fun SignalCanvas(s: SignalLane, ruleColor: Color) {
     Canvas(Modifier.fillMaxSize()) {
         val v = s.v
         if (v.size <= 1) return@Canvas
+        val times = s.times
+        if (times != null && times.size == v.size) {
+            // Motion: one stem per sample at its own time.
+            val lo = min(0.0, v.min())
+            val hi = max(lo + 1, v.max())
+            for (i in v.indices) {
+                val x = (size.width * times[i]).toFloat()
+                val y = 5f + (1f - ((v[i] - lo) / (hi - lo)).toFloat()) * (size.height - 10f)
+                drawLine(s.color, Offset(x, size.height - 5f), Offset(x, y), strokeWidth = 1.5f)
+            }
+            return@Canvas
+        }
         val lo = v.min()
         val hi = v.max()
         val rng = max(hi - lo, 1e-6)
         val pad = 5f
+        fun yOf(value: Double) = pad + (1f - ((value - lo) / rng).toFloat()) * (size.height - 2 * pad)
+        val timed = s.timed
+        if (timed != null && timed.size > 1) {
+            // Real timestamps: one line + fill per contiguous run; gaps stay empty.
+            for (seg in Sleep.contiguousSegments(timed)) {
+                val xs = seg.map { (size.width * it.fraction).toFloat() }
+                val line = Path().apply {
+                    moveTo(xs[0], yOf(seg[0].value))
+                    if (seg.size == 1) lineTo(min(size.width, xs[0] + 1.5f), yOf(seg[0].value))
+                    else for (k in 1 until seg.size) lineTo(xs[k], yOf(seg[k].value))
+                }
+                val endX = if (seg.size == 1) min(size.width, xs[0] + 1.5f) else xs.last()
+                val area = Path().apply {
+                    addPath(line)
+                    lineTo(endX, size.height)
+                    lineTo(xs[0], size.height)
+                    close()
+                }
+                drawPath(area, s.color.copy(alpha = 0.10f))
+                drawPath(line, s.color, style = Stroke(1.3f))
+            }
+            val x0 = (size.width * timed.first().fraction).toFloat()
+            val x1 = (size.width * timed.last().fraction).toFloat()
+            val my = yOf(v.sum() / v.size)
+            drawLine(
+                s.color.copy(alpha = 0.4f), Offset(x0, my), Offset(x1, my), strokeWidth = 0.6f,
+                pathEffect = PathEffect.dashPathEffect(floatArrayOf(3f, 3f)),
+            )
+            return@Canvas
+        }
         fun pt(i: Int) = Offset(
             (size.width * (s.span[0] + (s.span[1] - s.span[0]) * i / (v.size - 1).toDouble())).toFloat(),
             pad + (1f - ((v[i] - lo) / rng).toFloat()) * (size.height - 2 * pad),
@@ -271,20 +328,50 @@ private fun buildLanes(night: NightRow, chart: Color): List<Lane> {
     night.hypnogram?.takeIf { it.size > 1 }?.let {
         out.add(Lane("Hypnogram", "", null, Sleep.smooth(it, 5)))
     }
-    fun sig(label: String, unit: String, v: List<Double>?, dp: Int = 0, span: List<Double>? = null) {
+    val dur = night.durationS
+    fun sig(
+        label: String,
+        unit: String,
+        v: List<Double>?,
+        dp: Int = 0,
+        span: List<Double>? = null,
+        times: List<Double>? = null,
+        rawTimed: List<List<Double>>? = null,
+    ) {
+        // Prefer real timestamps (`series_t`): a stream that stops early (5-min HR ends at
+        // wake) must not be stretched across the whole night. Same as iOS and the web.
+        val timed = Sleep.timedSamples(rawTimed, night.startUnix, night.endUnix)
+        if (timed != null && timed.size > 1) {
+            out.add(
+                Lane(
+                    label, unit,
+                    SignalLane(timed.map { it.value }, chart, dp, listOf(timed.first().fraction, timed.last().fraction), timed = timed, durationS = dur),
+                    null,
+                )
+            )
+            return
+        }
         if (v == null || v.size <= 1) return
         // `temp_span` records the actual coverage inside an extended sleep window, so we
         // leave a visible gap after the last trustworthy sample rather than stretching the
         // series across the whole night. See docs/clients.md.
         val coverage = span?.takeIf { it.size == 2 } ?: listOf(0.0, 1.0)
-        out.add(Lane(label, unit, SignalLane(v, chart, dp, coverage), null))
+        out.add(Lane(label, unit, SignalLane(v, chart, dp, coverage, times = times, durationS = dur), null))
     }
     val s = night.series
-    sig("Heart rate", "bpm", s?.hr)
-    sig("HRV", "ms", s?.hrv)
-    sig("Blood O₂", "%", s?.spo2)
-    sig("Skin temp", "°C", s?.temp, dp = 1, span = s?.tempSpan)
-    sig("Motion", "s", s?.motion)
+    val st = night.seriesT
+    sig("Heart rate", "bpm", s?.hr, rawTimed = st?.hr)
+    sig("HRV", "ms", s?.hrv, rawTimed = st?.hrv)
+    sig("Blood O₂", "%", s?.spo2, rawTimed = st?.spo2)
+    sig("Skin temp", "°C", s?.temp, dp = 1, span = s?.tempSpan, rawTimed = st?.temp)
+    // Motion: timestamped `series_t.motion` first, then `series.motion_time`. Legacy
+    // exports lost motion timestamps; don't invent their positions.
+    val timedMotion = Sleep.timedSamples(st?.motion, night.startUnix, night.endUnix)
+    if (timedMotion != null && timedMotion.size > 1) {
+        sig("Motion", "s", timedMotion.map { it.value }, times = timedMotion.map { it.fraction })
+    } else if (s?.motionTime != null && s.motionTime.size == s.motion.size) {
+        sig("Motion", "s", s.motion, times = s.motionTime)
+    }
     return out
 }
 
@@ -298,7 +385,16 @@ private fun gutterValue(lane: Lane, cursorF: Float?): String {
     fun format(x: Double) = if (s.dp > 0) "%.${s.dp}f".format(x) else "${x.roundToInt()}"
     if (cursorF != null) {
         val f = cursorF.toDouble()
+        s.timed?.let { timed ->
+            val v = Sleep.sampleAt(f, timed, s.durationS) ?: return "—"
+            return "${format(v)} ${lane.unit}"
+        }
         if (f < s.span[0] || f > s.span[1]) return "—"
+        s.times?.let { times ->
+            val i = times.indices.minByOrNull { abs(times[it] - f) } ?: return "—"
+            if (abs(times[i] - f) * s.durationS > 30) return "—"
+            return "${format(s.v[i])} ${lane.unit}"
+        }
         val local = (f - s.span[0]) / max(1e-9, s.span[1] - s.span[0])
         val v = s.v[(local * (s.v.size - 1)).toInt().coerceIn(0, s.v.size - 1)]
         return "${format(v)} ${lane.unit}"

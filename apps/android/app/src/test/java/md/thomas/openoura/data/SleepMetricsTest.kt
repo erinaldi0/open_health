@@ -197,4 +197,31 @@ class SleepMetricsTest {
         val legacy = precomputed.copy(autonomic = null)
         assertEquals(80.0, Sleep.autonomic(legacy, stages).hrDeep!!, 1e-9)
     }
+
+    @Test
+    fun `timedSamples places samples on the night window and drops outsiders`() {
+        val t = Sleep.timedSamples(
+            listOf(listOf(900.0, 1.0), listOf(1000.0, 2.0), listOf(1500.0, 3.0), listOf(2000.0, 4.0), listOf(2001.0, 5.0)),
+            startUnix = 1000, endUnix = 2000,
+        )!!
+        assertEquals(listOf(0.0, 0.5, 1.0), t.map { it.fraction })
+        assertNull(Sleep.timedSamples(emptyList(), 1000, 2000))
+        assertNull(Sleep.timedSamples(listOf(listOf(1500.0, 1.0)), 2000, 1000)) // inverted window
+    }
+
+    @Test
+    fun `contiguousSegments breaks the line only on gaps longer than 15 minutes`() {
+        fun at(u: Double) = TimedSample(u, 0.0, 1.0)
+        val segs = Sleep.contiguousSegments(listOf(at(0.0), at(900.0), at(1801.0), at(1900.0)))
+        // 0→900 is exactly the limit (kept together); 900→1801 is one second over.
+        assertEquals(listOf(2, 2), segs.map { it.size })
+    }
+
+    @Test
+    fun `sampleAt reads the nearest sample, or nothing inside a gap`() {
+        val samples = listOf(TimedSample(0.0, 0.0, 50.0), TimedSample(0.0, 1.0, 70.0))
+        val night = 8 * 3600.0
+        assertEquals(50.0, Sleep.sampleAt(0.01, samples, night)!!, 1e-9) // ~5 min away
+        assertNull(Sleep.sampleAt(0.5, samples, night)) // 4 h from either sample
+    }
 }

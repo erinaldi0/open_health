@@ -111,8 +111,9 @@ fun RootScreen(
             item { SleepDebtCard(debt, onOpenSleepDebt) }
         }
 
-        s.illness?.let { illness ->
-            item { IllnessCard(illness) }
+        // On-device model when it ran, else the core's model-free radar (lite build too).
+        s.symptomRadar?.let { radar ->
+            item { IllnessCard(radar) }
         }
 
         item { CardioCard(s.cardio, s.fitness) }
@@ -126,6 +127,22 @@ fun RootScreen(
                     fontSize = 13.sp,
                     color = colors.link,
                 )
+            }
+        }
+
+        // Nights the shared brain withheld because the ring clock couldn't be resolved
+        // unambiguously (missing anchor, accelerated counter, multi-reboot stall).
+        s.clock?.warnings?.takeIf { it.isNotEmpty() }?.let { warnings ->
+            item {
+                Column(
+                    Modifier.fillMaxWidth().obsCard(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Rule("ring clock")
+                    for (w in warnings) {
+                        Text("• $w", fontFamily = Obs.mono, fontSize = 11.sp, color = colors.bad)
+                    }
+                }
             }
         }
 
@@ -157,9 +174,15 @@ fun RootScreen(
                         device.batteryPct?.let { "$it%" } ?: "—",
                         accent = if ((device.batteryPct ?: 100) < 20) colors.bad else colors.ink,
                     )
+                    (device.rawEvents ?: device.totalEvents)?.let { raw ->
+                        ObsStat("events", device.decodedEvents?.let { "$raw raw · $it decoded" } ?: "$raw")
+                    }
                     ObsStat("synced", listOfNotNull(device.synced, device.syncedHm).joinToString(" "))
-                    ObsStat("days of data", fmt(device.daysOfData))
-                    ObsStat("nights", device.nights?.toString() ?: "—")
+                    ObsStat(
+                        "days of data",
+                        fmt(device.daysOfData) + (device.observedDays?.let { " ($it observed)" } ?: ""),
+                    )
+                    ObsStat("nights", (device.nights ?: s.nights.size).toString())
                 }
             }
         }
@@ -257,9 +280,18 @@ private fun VitalsGrid(s: Summary, onOpenVital: (VitalKind) -> Unit) {
             Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                 for (kind in row) {
                     val points = kind.series(s)
+                    // Heart rate shows the newest synced reading (the core keeps only pulses
+                    // the firmware's quality gate accepted); the sparkline stays the nightly
+                    // minimum. Same as iOS RootView.
+                    val latestHr = s.vitals.hr?.takeIf { kind == VitalKind.HEART_RATE && it.latest != null }
                     VitalCell(
                         tag = kind.title,
-                        value = fmt(points.lastOrNull()?.value, kind.decimals),
+                        value = fmt(latestHr?.latest ?: points.lastOrNull()?.value, kind.decimals),
+                        detail = when (kind) {
+                            VitalKind.HEART_RATE -> latestHr?.let { latestLabel(it.date, it.hm) } ?: "nightly minimum"
+                            VitalKind.TEMP, VitalKind.OXYGEN -> points.lastOrNull()?.let { latestLabel(it.date) }
+                            else -> null
+                        },
                         unit = kind.unit,
                         modifier = Modifier.weight(1f),
                         delta = when (kind) {
@@ -277,4 +309,10 @@ private fun VitalsGrid(s: Summary, onOpenVital: (VitalKind) -> Unit) {
             }
         }
     }
+}
+
+/** "latest · 03-14 · 07:12" — the newest reading's date (MM-DD) and time, as on iOS. */
+private fun latestLabel(date: String?, time: String? = null): String {
+    val stamp = listOfNotNull(date?.takeLast(5), time).joinToString(" · ")
+    return if (stamp.isEmpty()) "latest sync" else "latest · $stamp"
 }
