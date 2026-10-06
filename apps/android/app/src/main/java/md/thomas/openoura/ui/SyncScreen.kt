@@ -9,6 +9,9 @@ import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import android.content.Intent
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,12 +27,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,6 +61,23 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
     var key by remember { mutableStateOf(RingKeyStore.load(context) ?: "") }
     var showDiagnostics by remember { mutableStateOf(false) }
     var permissionNote by remember { mutableStateOf<String?>(null) }
+    var dataNote by remember { mutableStateOf<String?>(null) }
+    var dataBusy by remember { mutableStateOf(false) }
+    var confirmRestore by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) {
+            dataNote = "Restore cancelled."
+            return@rememberLauncherForActivityResult
+        }
+        dataBusy = true
+        scope.launch {
+            dataNote = ring.restore(uri)
+            dataBusy = false
+            onSynced() // re-read the summary from the restored database
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -72,6 +95,16 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
     // A completed sync should refresh what is on screen behind this sheet.
     LaunchedEffect(ring.lastSummary) {
         if (ring.lastSummary != null) onSynced()
+    }
+
+    if (confirmRestore) {
+        RestoreConfirmDialog(
+            onConfirm = {
+                confirmRestore = false
+                restorePicker.launch(arrayOf("*/*"))
+            },
+            onDismiss = { confirmRestore = false },
+        )
     }
 
     Sheet("Sync", onBack) {
@@ -116,6 +149,9 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
                 color = if (key.isEmpty() || isValidRingKey(key)) colors.muted else colors.bad,
             )
 
+            if (ring.busy) {
+                ActionRow("Pause sync") { ring.pause() }
+            }
             ActionRow(if (ring.busy) "Syncing…" else "Connect & Sync") {
                 if (ring.busy) return@ActionRow
                 // Ask for any missing Bluetooth grants and — on API 33+ — notification
@@ -141,6 +177,43 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
                     ObsStat("newly inserted", "${report.inserted}")
                     ObsStat("next cursor", "${report.nextCursor}")
                 }
+            }
+
+            Rule("your data")
+            ActionRow("Check database") {
+                if (dataBusy) return@ActionRow
+                dataBusy = true
+                scope.launch {
+                    dataNote = ring.checkDatabase()
+                    dataBusy = false
+                }
+            }
+            ActionRow("Export raw ring data") {
+                if (dataBusy) return@ActionRow
+                dataBusy = true
+                dataNote = "Preparing database…"
+                scope.launch {
+                    ring.exportRawDatabase()
+                        .onSuccess { file ->
+                            dataNote = null
+                            shareDatabase(context, file)
+                        }
+                        .onFailure { dataNote = "Export failed: ${it.message ?: it}" }
+                    dataBusy = false
+                }
+            }
+            ActionRow("Restore from a backup") {
+                if (!dataBusy) confirmRestore = true
+            }
+            Text(
+                "The export is a copy of the ring's raw records (no auth key). Open it on a " +
+                    "computer with `oura --db <file> dashboard`, or restore it here later.",
+                fontFamily = Obs.prose,
+                fontSize = 12.sp,
+                color = colors.muted,
+            )
+            dataNote?.let {
+                Text(it, fontFamily = Obs.mono, fontSize = 12.sp, color = colors.ink2)
             }
 
             Rule("danger zone")
@@ -188,6 +261,35 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun RestoreConfirmDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Restore from a backup?") },
+        text = {
+            Text(
+                "This replaces the ring data on this phone with the backup. Anything synced " +
+                    "after that backup was made is lost here (the ring still has its own " +
+                    "history). The file is checked first; a damaged one changes nothing."
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Choose file") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** Hand the exported database to the share sheet through the FileProvider. */
+private fun shareDatabase(context: Context, file: java.io.File) {
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "application/octet-stream"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, file.name)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "Export raw ring data"))
 }
 
 @Composable

@@ -10,6 +10,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import java.util.concurrent.TimeUnit
 
 /**
@@ -53,6 +54,28 @@ object SyncScheduler {
             .build()
         WorkManager.getInstance(context)
             .enqueueUniqueWork(ONESHOT_NAME, ExistingWorkPolicy.KEEP, request)
+    }
+
+    /**
+     * Stop the sync that is running now. A running one-shot is simply cancelled. A running
+     * *periodic* run can't be stopped without cancelling its schedule, so it is re-registered
+     * with a full-period initial delay — without it the new periodic request would start
+     * straight away and undo the pause. The checkpointed cursor makes the next run resume.
+     */
+    suspend fun pause(context: Context) {
+        val wm = WorkManager.getInstance(context)
+        wm.cancelUniqueWork(ONESHOT_NAME)
+        val periodicRunning = wm.getWorkInfosForUniqueWorkFlow(PERIODIC_NAME).first()
+            .any { it.state == WorkInfo.State.RUNNING }
+        if (periodicRunning) {
+            wm.cancelUniqueWork(PERIODIC_NAME)
+            val request = PeriodicWorkRequestBuilder<RingSyncWorker>(PERIOD_HOURS, TimeUnit.HOURS)
+                .setInputData(workDataOf(RingSyncWorker.KEY_SOURCE to RingSyncWorker.SOURCE_SCHEDULED))
+                .setInitialDelay(PERIOD_HOURS, TimeUnit.HOURS)
+                .addTag(TAG)
+                .build()
+            wm.enqueueUniquePeriodicWork(PERIODIC_NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+        }
     }
 
     /** All sync work items (periodic + one-shot), for the UI to derive busy/status from. */

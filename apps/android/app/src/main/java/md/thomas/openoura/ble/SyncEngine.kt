@@ -276,6 +276,14 @@ class SyncEngine(private val context: Context) {
                     )
                     onStatus("synced — ${report.inserted} new events from ${report.serial}")
                     return@coroutineScope report
+                } catch (e: CancellationException) {
+                    // Paused (or the worker was stopped). Tell Rust explicitly so it stops at
+                    // its next await instead of mid-request; the drain checkpointed every
+                    // batch, so the next sync resumes from here. Not an attempt failure —
+                    // falling into the catch-all below would log it as one and retry.
+                    log("sync", "attempt $attempt cancelled — ${e.message ?: "paused"}")
+                    session.cancel("paused")
+                    throw e
                 } catch (e: Throwable) {
                     // The Rust layer packs the diagnostic detail (auth state, missing
                     // summary, cursor) into this message — log it verbatim.

@@ -224,6 +224,9 @@ fun VitalTrendScreen(s: Summary, kind: VitalKind, onBack: () -> Unit) {
             } else {
                 EmptyNote("Not enough nights in this window yet.")
             }
+            // The nightly minimum says how recent sleep went; the hourly bars show the
+            // day you're in. Same pairing as iOS VitalTrendView.
+            if (kind == VitalKind.HEART_RATE) HourlyHeartRateSection()
         }
     }
 }
