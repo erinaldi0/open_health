@@ -25,6 +25,7 @@ import md.thomas.openoura.ble.SyncScheduler
 import md.thomas.openoura.data.VitalKind
 import md.thomas.openoura.health.HealthExport
 import md.thomas.openoura.store.ProfileStore
+import md.thomas.openoura.ui.heartrate.LiveHeartRateScreen
 
 /**
  * Destinations. iOS presents these as sheets over a single root; here they are
@@ -39,6 +40,7 @@ sealed interface Route {
     data object Profile : Route
     data object SleepDebt : Route
     data class Vital(val kind: VitalKind) : Route
+    data object LiveHeartRate : Route
 }
 
 @Composable
@@ -96,6 +98,7 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
             onOpenAllDays = { route = Route.AllDays },
             onOpenSleepDebt = { route = Route.SleepDebt },
             onOpenVital = { route = Route.Vital(it) },
+            onOpenLiveHeartRate = { route = Route.LiveHeartRate },
             modifier = base,
         )
 
@@ -129,6 +132,11 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
             ring = ring,
             onBack = { route = Route.Home },
             onSynced = { vm.reload() },
+        )
+
+        Route.LiveHeartRate -> LiveHeartRateScreen(
+            onBack = { route = Route.Home },
+            modifier = base,
         )
 
         Route.Profile -> ProfileScreen(

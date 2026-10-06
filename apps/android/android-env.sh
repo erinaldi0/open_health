@@ -33,6 +33,17 @@ NDK_RUNTIME_DIR="$(ls -d "$NDK_PREBUILT"/lib/clang/*/lib/linux 2>/dev/null | sor
 NDK_CLANG_MAJOR="$(basename "$(ls -d "$NDK_PREBUILT"/lib/clang/* 2>/dev/null | sort -V | tail -1)")"
 NDK_RESOURCE_DIR="$NDK_PREBUILT/lib/clang/$NDK_CLANG_MAJOR"
 
+# macOS: Google's darwin NDK toolchain is a universal binary, so it runs natively and the
+# host-compiler detour isn't needed. It is also *required*: Apple's `ar` cannot index ELF
+# objects and silently writes an empty archive, so the bundled SQLite never gets linked and
+# liboura_core.so fails to load on the device ("cannot locate symbol sqlite3_finalize").
+if [ "$(uname -s)" = "Darwin" ]; then
+    : "${HOST_CC:=$NDK_PREBUILT/bin/clang}"
+    : "${HOST_CXX:=$NDK_PREBUILT/bin/clang++}"
+    : "${HOST_AR:=$NDK_PREBUILT/bin/llvm-ar}"
+    : "${HOST_RANLIB:=$NDK_PREBUILT/bin/llvm-ranlib}"
+fi
+
 if [ -z "${HOST_CC:-}" ]; then
     HOST_CC="$(command -v "clang-$NDK_CLANG_MAJOR" 2>/dev/null || command -v clang)"
 fi

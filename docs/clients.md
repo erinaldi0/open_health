@@ -146,6 +146,20 @@ which is why Oura's own app has no per-night HRV trend either.
   export of workouts (add/remove as detections change), sleep stages, heart rate, HRV,
   resting HR, steps, calories, and distance.
 
+### Android-only, not yet on iOS or web
+
+- **Live heart rate** (`ui/heartrate/`): streams beat-by-beat bpm/IBI from the worn ring via
+  `RingSession.live_heart_rate` in `oura-core`, which wraps oura-link's `live_heart_rate`
+  (daytime HR in `CONNECTED_LIVE` mode). iOS can call the same UniFFI method from
+  `RingSync.swift`; the web dashboard would need an endpoint over `oura live-hr`'s client
+  call. Stop via `stop_live_heart_rate` and await — cancelling the call skips the restore
+  to `AUTOMATIC` and leaves the ring in live mode. The displayed bpm is smoothed client-side
+  by `ui/heartrate/HeartRateSmoother.kt` (30% median artifact rejection, then
+  60000 / mean IBI over the last 10 s of beats) — port it with its JVM tests, not a plain
+  per-beat average. `SignalQuality.kt` hides the number as "weak signal" when accepted beats
+  cover < 60% of the last 15 s: with poor contact the ring's few locked beats are wrong, not
+  just noisy (143 vs a watch's 72). Threshold calibrated on Ring 5 captures.
+
 ### Android-specific divergences (deliberate, not bugs)
 
 - **Typography**: iOS uses New York (system serif) and SF Mono. Neither exists on Android, so

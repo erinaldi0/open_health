@@ -103,7 +103,8 @@ use std::sync::{Arc, Mutex};
 use oura_link::transport::Transport;
 use oura_link::OuraClient;
 use oura_store::storage::Store;
-use tokio::sync::broadcast;
+use oura_protocol::protocol::{self, feature, feature_mode};
+use tokio::sync::{broadcast, Notify};
 
 /// Swift implements this to send one request frame over CoreBluetooth. Fire-and-
 /// forget: the ring's responses come back asynchronously via `push_frame`.
@@ -119,6 +120,15 @@ pub trait BleWriter: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait SyncProgressListener: Send + Sync {
     fn on_progress(&self, stage: String, bytes_left: u64, events_synced: u32);
+}
+
+/// The client implements this to receive a live heart-rate stream. `on_status` gets
+/// the same short stage tags as sync ("auth" / "setup") plus "live" once the ring
+/// has been switched to live mode; `on_sample` gets each valid beat.
+#[uniffi::export(callback_interface)]
+pub trait HeartRateListener: Send + Sync {
+    fn on_status(&self, stage: String);
+    fn on_sample(&self, bpm: u16, ibi_ms: u16);
 }
 
 #[derive(uniffi::Record)]
@@ -141,6 +151,9 @@ pub enum SyncError {
 pub struct RingSession {
     tx: broadcast::Sender<Vec<u8>>,
     writer: Arc<dyn BleWriter>,
+    // Ends `live_heart_rate` early. A Notify (not a flag) so a stop that lands before
+    // the stream starts still counts: notify_one leaves a permit for the next waiter.
+    stop_live: Notify,
 }
 
 /// Bridges oura-link's `Transport` onto the Swift writer + the inbound frame channel.
@@ -243,7 +256,64 @@ impl RingSession {
         Arc::new(Self {
             tx,
             writer: Arc::from(writer),
+            stop_live: Notify::new(),
         })
+    }
+
+    /// Authenticate, switch the ring's daytime HR to live mode, and report each beat
+    /// to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
+    /// (a battery backstop if the client never stops). The ring must be worn.
+    ///
+    /// Always restores the feature to AUTOMATIC before returning. Callers should stop
+    /// via `stop_live_heart_rate` and await this call rather than cancel it: cancelling
+    /// drops the future, and with it the restore, leaving the ring in live mode.
+    pub async fn live_heart_rate(
+        &self,
+        key_hex: String,
+        max_seconds: u32,
+        listener: Box<dyn HeartRateListener>,
+    ) -> Result<(), SyncError> {
+        let fail = |e: String| SyncError::Failed(e);
+        let key =
+            parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let client = OuraClient::new(FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        });
+
+        listener.on_status("auth".into());
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+        listener.on_status("setup".into());
+        client
+            .setup_app_stream()
+            .await
+            .map_err(|e| fail(e.to_string()))?;
+
+        listener.on_status("live".into());
+        let duration = std::time::Duration::from_secs(max_seconds.into());
+        let streamed = tokio::select! {
+            r = client.live_heart_rate(duration, false, |s| listener.on_sample(s.bpm, s.ibi_ms)) => r,
+            _ = self.stop_live.notified() => Ok(()),
+        };
+        // oura-link restores AUTOMATIC itself only when its loop runs to the end; a stop
+        // drops it mid-stream, so restore here unconditionally (it is idempotent).
+        let restored = client
+            .transport()
+            .write(&protocol::req_set_feature_mode(
+                feature::DAYTIME_HR,
+                feature_mode::AUTOMATIC,
+            ))
+            .await;
+        streamed.map_err(|e| fail(e.to_string()))?;
+        restored.map_err(|e| fail(e.to_string()))
+    }
+
+    /// End a running `live_heart_rate` call; it restores the ring and returns.
+    pub fn stop_live_heart_rate(&self) {
+        self.stop_live.notify_one();
     }
 
     /// Swift pushes each inbound BLE notification frame here.

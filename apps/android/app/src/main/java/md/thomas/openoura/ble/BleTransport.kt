@@ -608,6 +608,7 @@ class BleTransport(
     }
 
     private fun onFrame(c: BluetoothGattCharacteristic, value: ByteArray) {
+        android.util.Log.d("BleTransport", "Received frame on ${c.uuid}:${value.joinToString { "%02x".format(it) }}")
         if (value.isEmpty()) return
         if (isHistoryPayload(value)) {
             synchronized(lock) {

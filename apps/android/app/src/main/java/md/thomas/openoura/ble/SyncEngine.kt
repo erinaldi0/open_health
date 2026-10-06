@@ -1,9 +1,14 @@
 package md.thomas.openoura.ble
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.coroutineScope
@@ -11,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import md.thomas.openoura.diag.Diagnostics.log
 import md.thomas.openoura.store.DB
 import md.thomas.openoura.store.Prefs
@@ -18,6 +24,7 @@ import md.thomas.openoura.store.RingKeyStore
 import md.thomas.openoura.store.isValidRingKey
 import md.thomas.openoura.store.secretFingerprint
 import uniffi.oura_core.BleWriter
+import uniffi.oura_core.HeartRateListener
 import uniffi.oura_core.RingSession
 import uniffi.oura_core.SyncProgressListener
 import uniffi.oura_core.SyncReport
@@ -69,6 +76,9 @@ class SyncEngine(private val context: Context) {
             min(60_000L, 5_000L shl (attempt - 2))
         }
         const val SCHEDULED_MAX_ATTEMPTS = 5
+
+        /** Battery backstop for a live HR stream the UI forgets to stop. */
+        const val LIVE_HR_MAX_SECONDS: UInt = 1800u
 
         // Process-wide single-flight across the periodic worker, the app-start/manual
         // one-shots, and any overlap between them. tryLock() == false is exactly the
@@ -322,6 +332,107 @@ class SyncEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Stream live heart rate from the worn ring until the calling coroutine is cancelled
+     * (or [LIVE_HR_MAX_SECONDS] elapses). Takes the same single-flight lock as [run]: the
+     * ring has one BLE link, so a live stream and a sync cannot share it.
+     *
+     * Cancellation must not reach the FFI call — UniFFI frees the Rust future on cancel,
+     * which would skip its restore and leave the ring's daytime HR in live mode (draining
+     * its battery). So the call runs in its own scope; on cancel we signal
+     * [RingSession.stopLiveHeartRate], await the restore, and flush it to the ring before
+     * dropping the link.
+     */
+    suspend fun liveHeartRate(
+        onHeartRate: (bpm: Int, ibiMs: Int) -> Unit,
+        onStatus: (String) -> Unit,
+    ) {
+        if (!runLock.tryLock()) {
+            onStatus("a ring sync is in progress — try again when it finishes")
+            return
+        }
+        try {
+            val key = RingKeyStore.load(context)?.trim()
+            if (key == null || !isValidRingKey(key)) {
+                onStatus("no valid ring key stored yet — open Sync and paste your 32-hex key")
+                return
+            }
+            if (BlePermissions.missing(context).isNotEmpty()) {
+                onStatus("Bluetooth permission is required — grant it and try again")
+                return
+            }
+
+            onStatus("connecting to ring…")
+            val t = BleTransport(context, nameContains = "Oura")
+            try {
+                t.connect()
+            } catch (e: CancellationException) {
+                t.shutdown()
+                throw e
+            } catch (e: Throwable) {
+                log("live-hr", "BLE connect FAILED: $e")
+                onStatus(
+                    "couldn't connect (${e.message ?: e}) — make sure the ring is nearby and " +
+                        "the official Oura app isn't holding it"
+                )
+                t.shutdown()
+                return
+            }
+
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            val writer = RingWriter(t, scope)
+            val session = RingSession(writer)
+            scope.launch { t.notifications().consumeEach { session.pushFrame(it) } }
+            val listener = object : HeartRateListener {
+                override fun onStatus(stage: String) {
+                    onStatus(
+                        when (stage) {
+                            "auth" -> "authenticating…"
+                            "setup" -> "preparing ring…"
+                            "live" -> "waiting for a heartbeat — keep the ring on and stay still"
+                            else -> stage
+                        }
+                    )
+                }
+
+                override fun onSample(bpm: UShort, ibiMs: UShort) {
+                    onHeartRate(bpm.toInt(), ibiMs.toInt())
+                }
+            }
+            val call = scope.async {
+                session.liveHeartRate(keyHex = key, maxSeconds = LIVE_HR_MAX_SECONDS, listener = listener)
+            }
+            try {
+                call.await()
+                log("live-hr", "stream ended (time limit)")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                val message = e.message ?: e.toString()
+                log("live-hr", "FAILED: $message")
+                onStatus(
+                    if (isAuthenticationFailure(message)) {
+                        "the ring rejected authentication — force-stop the official Oura app and try again"
+                    } else {
+                        "live heart rate failed: $message"
+                    }
+                )
+            } finally {
+                withContext(NonCancellable) {
+                    session.stopLiveHeartRate()
+                    // Both bounded: a dead link must not wedge the lock forever.
+                    withTimeoutOrNull(5_000) { runCatching { call.await() } }
+                    withTimeoutOrNull(3_000) { writer.flush() }
+                    scope.cancel()
+                    session.close()
+                    t.shutdown()
+                }
+            }
+        } finally {
+            runLock.unlock()
+        }
+    }
+
     /** Bridges Rust sync-progress callbacks (arriving on a tokio thread) to [onStatus]. */
     private inner class ProgressBridge(private val onStatus: (String) -> Unit) : SyncProgressListener {
         override fun onProgress(stage: String, bytesLeft: ULong, eventsSynced: UInt) {
@@ -406,5 +517,10 @@ internal class RingWriter(
                 }
             }
         }
+    }
+
+    /** Suspend until every write queued so far has gone out (or failed). */
+    suspend fun flush() {
+        synchronized(lock) { tail }.join()
     }
 }

@@ -40,6 +40,7 @@ fun RootScreen(
     onOpenAllDays: () -> Unit,
     onOpenSleepDebt: () -> Unit,
     onOpenVital: (VitalKind) -> Unit,
+    onOpenLiveHeartRate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = Obs.colors
@@ -102,6 +103,10 @@ fun RootScreen(
 
         item { VitalsGrid(s, onOpenVital) }
 
+        item {
+            LiveHeartRateCard(onOpenLiveHeartRate = onOpenLiveHeartRate)
+        }
+
         s.sleepDebt?.let { debt ->
             item { SleepDebtCard(debt, onOpenSleepDebt) }
         }
@@ -162,6 +167,33 @@ fun RootScreen(
 }
 
 @Composable
+private fun LiveHeartRateCard(onOpenLiveHeartRate: () -> Unit) {
+    val colors = Obs.colors
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .obsCard()
+            .clickable(onClick = onOpenLiveHeartRate),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Rule("live telemetry")
+        Text(
+            "Live Heart Rate",
+            fontFamily = Obs.serif,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Medium,
+            color = colors.ink,
+        )
+        Text(
+            "Stream PPG pulses directly from the ring over Bluetooth",
+            fontFamily = Obs.prose,
+            fontSize = 13.sp,
+            color = colors.ink2,
+        )
+    }
+}
+
+@Composable
 private fun Header(
     loading: Boolean,
     progress: String?,
@@ -195,8 +227,6 @@ private fun Header(
                 modifier = Modifier.clickable(onClick = onOpenSync),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // The status light from iOS's SyncIndicatorButton: ink while busy, green
-                // when a sync landed recently, otherwise a quiet outline.
                 Box(
                     Modifier.size(8.dp).background(
                         when {

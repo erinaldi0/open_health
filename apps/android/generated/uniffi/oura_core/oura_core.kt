@@ -666,6 +666,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 internal interface UniffiCallbackInterfaceBleWriterMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceHeartRateListenerMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`stage`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceHeartRateListenerMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`bpm`: Short,`ibiMs`: Short,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceSyncProgressListenerMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`stage`: RustBuffer.ByValue,`bytesLeft`: Long,`eventsSynced`: Int,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -681,6 +687,25 @@ internal open class UniffiVTableCallbackInterfaceBleWriter(
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceBleWriter) {
         `write` = other.`write`
+        `uniffiFree` = other.`uniffiFree`
+    }
+
+}
+@Structure.FieldOrder("onStatus", "onSample", "uniffiFree")
+internal open class UniffiVTableCallbackInterfaceHeartRateListener(
+    @JvmField internal var `onStatus`: UniffiCallbackInterfaceHeartRateListenerMethod0? = null,
+    @JvmField internal var `onSample`: UniffiCallbackInterfaceHeartRateListenerMethod1? = null,
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+) : Structure() {
+    class UniffiByValue(
+        `onStatus`: UniffiCallbackInterfaceHeartRateListenerMethod0? = null,
+        `onSample`: UniffiCallbackInterfaceHeartRateListenerMethod1? = null,
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    ): UniffiVTableCallbackInterfaceHeartRateListener(`onStatus`,`onSample`,`uniffiFree`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceHeartRateListener) {
+        `onStatus` = other.`onStatus`
+        `onSample` = other.`onSample`
         `uniffiFree` = other.`uniffiFree`
     }
 
@@ -779,6 +804,13 @@ internal open class UniffiVTableCallbackInterfaceSyncProgressListener(
 
 
 
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -790,6 +822,7 @@ internal interface UniffiLib : Library {
                 uniffiCheckContractApiVersion(lib)
                 uniffiCheckApiChecksums(lib)
                 uniffiCallbackInterfaceBleWriter.register(lib)
+                uniffiCallbackInterfaceHeartRateListener.register(lib)
                 uniffiCallbackInterfaceSyncProgressListener.register(lib)
                 }
         }
@@ -806,11 +839,17 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_oura_core_fn_constructor_ringsession_new(`writer`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Pointer
+    fun uniffi_oura_core_fn_method_ringsession_live_heart_rate(`ptr`: Pointer,`keyHex`: RustBuffer.ByValue,`maxSeconds`: Int,`listener`: Long,
+    ): Long
     fun uniffi_oura_core_fn_method_ringsession_push_frame(`ptr`: Pointer,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_oura_core_fn_method_ringsession_stop_live_heart_rate(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_oura_core_fn_method_ringsession_sync(`ptr`: Pointer,`dbPath`: RustBuffer.ByValue,`keyHex`: RustBuffer.ByValue,`progress`: Long,
     ): Long
     fun uniffi_oura_core_fn_init_callback_vtable_blewriter(`vtable`: UniffiVTableCallbackInterfaceBleWriter,
+    ): Unit
+    fun uniffi_oura_core_fn_init_callback_vtable_heartratelistener(`vtable`: UniffiVTableCallbackInterfaceHeartRateListener,
     ): Unit
     fun uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(`vtable`: UniffiVTableCallbackInterfaceSyncProgressListener,
     ): Unit
@@ -942,13 +981,21 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_oura_core_checksum_func_summary_json(
     ): Short
+    fun uniffi_oura_core_checksum_method_ringsession_live_heart_rate(
+    ): Short
     fun uniffi_oura_core_checksum_method_ringsession_push_frame(
+    ): Short
+    fun uniffi_oura_core_checksum_method_ringsession_stop_live_heart_rate(
     ): Short
     fun uniffi_oura_core_checksum_method_ringsession_sync(
     ): Short
     fun uniffi_oura_core_checksum_constructor_ringsession_new(
     ): Short
     fun uniffi_oura_core_checksum_method_blewriter_write(
+    ): Short
+    fun uniffi_oura_core_checksum_method_heartratelistener_on_status(
+    ): Short
+    fun uniffi_oura_core_checksum_method_heartratelistener_on_sample(
     ): Short
     fun uniffi_oura_core_checksum_method_syncprogresslistener_on_progress(
     ): Short
@@ -981,7 +1028,13 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_oura_core_checksum_func_summary_json() != 27782.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_oura_core_checksum_method_ringsession_live_heart_rate() != 14542.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_method_ringsession_stop_live_heart_rate() != 49649.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_oura_core_checksum_method_ringsession_sync() != 10321.toShort()) {
@@ -991,6 +1044,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_oura_core_checksum_method_blewriter_write() != 56807.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_method_heartratelistener_on_status() != 65033.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_oura_core_checksum_method_heartratelistener_on_sample() != 25848.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_oura_core_checksum_method_syncprogresslistener_on_progress() != 32063.toShort()) {
@@ -1443,9 +1502,25 @@ private class AndroidSystemCleanable(
 public interface RingSessionInterface {
     
     /**
+     * Authenticate, switch the ring's daytime HR to live mode, and report each beat
+     * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
+     * (a battery backstop if the client never stops). The ring must be worn.
+     *
+     * Always restores the feature to AUTOMATIC before returning. Callers should stop
+     * via `stop_live_heart_rate` and await this call rather than cancel it: cancelling
+     * drops the future, and with it the restore, leaving the ring in live mode.
+     */
+    suspend fun `liveHeartRate`(`keyHex`: kotlin.String, `maxSeconds`: kotlin.UInt, `listener`: HeartRateListener)
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
     fun `pushFrame`(`data`: kotlin.ByteArray)
+    
+    /**
+     * End a running `live_heart_rate` call; it restores the ring and returns.
+     */
+    fun `stopLiveHeartRate`()
     
     /**
      * Authenticate, set up the app stream, and drain history events into the DB at
@@ -1554,6 +1629,37 @@ open class RingSession: Disposable, AutoCloseable, RingSessionInterface {
 
     
     /**
+     * Authenticate, switch the ring's daytime HR to live mode, and report each beat
+     * to `listener` until `stop_live_heart_rate` is called or `max_seconds` elapses
+     * (a battery backstop if the client never stops). The ring must be worn.
+     *
+     * Always restores the feature to AUTOMATIC before returning. Callers should stop
+     * via `stop_live_heart_rate` and await this call rather than cancel it: cancelling
+     * drops the future, and with it the restore, leaving the ring in live mode.
+     */
+    @Throws(SyncException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `liveHeartRate`(`keyHex`: kotlin.String, `maxSeconds`: kotlin.UInt, `listener`: HeartRateListener) {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_live_heart_rate(
+                thisPtr,
+                FfiConverterString.lower(`keyHex`),FfiConverterUInt.lower(`maxSeconds`),FfiConverterTypeHeartRateListener.lower(`listener`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_oura_core_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        SyncException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */override fun `pushFrame`(`data`: kotlin.ByteArray)
         = 
@@ -1561,6 +1667,20 @@ open class RingSession: Disposable, AutoCloseable, RingSessionInterface {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_push_frame(
         it, FfiConverterByteArray.lower(`data`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * End a running `live_heart_rate` call; it restores the ring and returns.
+     */override fun `stopLiveHeartRate`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_oura_core_fn_method_ringsession_stop_live_heart_rate(
+        it, _status)
 }
     }
     
@@ -1817,6 +1937,80 @@ internal object uniffiCallbackInterfaceBleWriter {
  * @suppress
  */
 public object FfiConverterTypeBleWriter: FfiConverterCallbackInterface<BleWriter>()
+
+
+
+
+
+/**
+ * The client implements this to receive a live heart-rate stream. `on_status` gets
+ * the same short stage tags as sync ("auth" / "setup") plus "live" once the ring
+ * has been switched to live mode; `on_sample` gets each valid beat.
+ */
+public interface HeartRateListener {
+    
+    fun `onStatus`(`stage`: kotlin.String)
+    
+    fun `onSample`(`bpm`: kotlin.UShort, `ibiMs`: kotlin.UShort)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceHeartRateListener {
+    internal object `onStatus`: UniffiCallbackInterfaceHeartRateListenerMethod0 {
+        override fun callback(`uniffiHandle`: Long,`stage`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeHeartRateListener.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onStatus`(
+                    FfiConverterString.lift(`stage`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onSample`: UniffiCallbackInterfaceHeartRateListenerMethod1 {
+        override fun callback(`uniffiHandle`: Long,`bpm`: Short,`ibiMs`: Short,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeHeartRateListener.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onSample`(
+                    FfiConverterUShort.lift(`bpm`),
+                    FfiConverterUShort.lift(`ibiMs`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeHeartRateListener.handleMap.remove(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceHeartRateListener.UniffiByValue(
+        `onStatus`,
+        `onSample`,
+        uniffiFree,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_oura_core_fn_init_callback_vtable_heartratelistener(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeHeartRateListener: FfiConverterCallbackInterface<HeartRateListener>()
 
 
 
