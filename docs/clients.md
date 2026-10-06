@@ -49,9 +49,9 @@ metric there once and both clients receive it in the JSON.
 | **Unified day (night + activity)** | `renderDay`, `dayCard` | `TodayCard` | `TodayCard` | `nights[]`, `activity*` | — |
 | **Full-page sleep report** (polysomnograph + clinical metrics + interpretation) | `openDayPage`→`sleepSection` (`tlBox` lanes from `nights[].series_t`, `hypnoSvg`) | `DayReportView`→`SleepReport`, `Polysomnograph` (Reports.swift) | `DayReportScreen`→`SleepReport`, `Polysomnograph` (Reports.kt) | `nights[].{stages_full,series,metrics}` | SleepNet |
 | **Sleep debt** (14-day card + cumulative debt / total sleep detail) | `renderSleepDebt`→`openSleepDebt` | `SleepDebtCard`→`SleepDebtDetail` | `SleepDebtCard`→`SleepDebtDetail` | `sleep_debt`, grouped by wake date including naps | SleepNet |
-| **Day JSON export** (iOS: the open tab's section; web: the whole day — night + debt, daily stats + MET profile + workouts, and the heart-rate slots) | `openDayPage` "Export JSON" → `exportDayJson` (download) | `DayReportView` export menu → `DayExport` (copy / share sheet) | — | same sections as the report | — |
+| **Day JSON export** (iOS: the open tab's section; web: the whole day — night + debt, daily stats + MET profile + workouts, and the heart-rate slots) | `openDayPage` "Export JSON" → `exportDayJson` (download) | `DayReportView` export menu → `DayExport` (copy / share sheet) | `DayReportScreen` "export" → `DayExport` (data/DayExport.kt; copy / share sheet) | same sections as the report | — |
 | **Full-page activity report** (24h MET profile + intensity metrics) | `openDayPage`→`activitySection`, `movementSvg` | `DayReportView`→`ActivityReport`, `MetProfile` (Reports.swift) | `DayReportScreen`→`ActivityReport`, `MetProfile` (Reports.kt) | `activity_profile`, `activity_daily`, `activity` | AAD |
-| **Heart rate across the day** (per-slot 5th–95th band + median tick; beats vs 5-min averages) | `openDayPage`→`heartSection`, `hrTimelineSvg` (`GET /api/hourly-hr?minutes=`; 15 min default, 1 h switch) | `HeartRate.swift` (`HourlyHR`, hourly) | — | `oura-summary::hourly_hr::{hr_bins, hourly_hr}` (not in the summary JSON) | — |
+| **Heart rate across the day** (per-slot 5th–95th band + median tick; beats vs 5-min averages) | `openDayPage`→`heartSection`, `hrTimelineSvg` (`GET /api/hourly-hr?minutes=`; 15 min default, 1 h switch) | `HeartRate.swift` (`HourlyHR`, hourly) | `HourlyHeartRateSection` (ui/HeartRate.kt, hourly) | `oura-summary::hourly_hr::{hr_bins, hourly_hr}` (not in the summary JSON) | — |
 | Stage breakdown | `stageBar` | `StageBreakdown` | `StageBar` (Charts.kt) | `nights[].{deep,light,rem,wake}_pct` | SleepNet |
 | **Autonomic recovery by stage** (mean HR/HRV in deep/light/REM) | `sleepSection` autonomic grid | `SleepReport` `autonomicGrid` | `SleepReport` autonomic grid | `nights[].autonomic` | SleepNet (needs hypnogram) |
 | **Cardiovascular age** | `renderCardio` | Cardio section | Cardio section | `cardio` | CVA (web: Python · native: `CvaModel`) |
@@ -61,7 +61,13 @@ metric there once and both clients receive it in the JSON.
 | Steps / active calories / **distance** | activity report stats | activity day stats | activity day stats | `activity_daily` (incl. `distance_m`) | — |
 | Previous days browser | `openDaysBrowser` → `openDayPage` | `AllDaysView` → `DayDetailView` | `AllDaysScreen` → `DayReportScreen` | day keys | — |
 | Device & data health | `renderDevice` | device section | device section | `device`, `streams` | — |
-| **Battery history** (level over the days with readings; charging runs drawn apart) | `renderDevice`→`batteryChart` | — | — | `device.battery_history` (`[unix, percent]`, 14 days) | — |
+| **Symptom Radar** (model or model-free; status + "View details") | illness section | `IllnessCard` (Reports.swift) | `IllnessCard` (Cards.kt) via `Summary.symptomRadar` | `illness` (on-device) / `symptoms` (core) | Illness (optional) |
+| **Sleep score** (literature-based, with sources) + breathing rate | — | `SleepScoreCard` | `SleepScoreCard` (Reports.kt) | `nights[].{sleep_score,breath_rate}` | — |
+| **Adjust bedtime / wake-up** | `sleepSection` `submitOverride` | `SleepReport.bedtimeEditor` + `BedtimeOverrideStore` | `BedtimeEditor` (Reports.kt) + `BedtimeOverrideStore` (data/BedtimeOverrides.kt) | `bedtime_overrides.json` next to the DB; `nights[].bedtime_manual` | — |
+| **Raw data browser** (event types, field charts) | per-type event stream | `RawDataView` (RawData.swift) | `RawDataScreen` (Sync → Browse raw data) | FFI `events_json` | — |
+| **Database export / check / restore** | — (desktop has the file) | Help & diagnostics | Sync → "your data" | FFI `export_database`, `database_integrity` | — |
+| **Ring clock warnings + per-boot report** | clock warnings | Home warnings, Technical reports | Home "ring clock" card, Sync diagnostics | `clock.{warnings,epochs,undated_nights}` | — |
+| **Battery history** (level over the days with readings; charging runs drawn apart) | `renderDevice`→`batteryChart` | — | — (decoded, not drawn) | `device.battery_history` (`[unix, percent]`, 14 days) | — |
 
 ## The day is one unit — pair night + activity by *wake date*
 
@@ -160,19 +166,20 @@ is personalized like Oura's (`SleepDebtInput.longTermSleepTimeAvgSeconds` ← th
 previous 90 days, IQR-outlier-filtered, clamped to 7–9 h, rounded to 15 min, causal (a
 night never sets its own need), with an 8 h fallback below 14 valid history days — see
 Rust `sleep_need_s` and its Swift mirror `needS(on:)` in `stagedSleepDebt`. The web reads it from the
-summary JSON; iOS and Android recompute from the
-**on-device** SleepNet hypnogram (`NightRow.stages`), because both run `build_summary` with
-`NoModelRunner` (no server-side staging), so the FFI `stages_full`/`metrics` are empty there.
+summary JSON; iOS and Android recompute from the full hypnogram (`NightRow.hypnogram` =
+`stages_full ?? stages`). The FFI now ships the ring's own hypnogram in `stages_full` even
+under `NoModelRunner`; the on-device SleepNet replaces it when it runs. Never compute from
+`stages` alone — it is a ≤120-cell preview. A night with unstaged (0) epochs is
+`staging_complete == false`: metrics are withheld and its wake day is left out of the debt.
 The raw signal series (`nights[].series`) DO come from the FFI everywhere. If you change the
 smoothing window or a metric definition, change **all three** implementations.
 
 **Autonomic-by-stage** (mean HR/HRV per sleep stage) is the same story: Rust
 `autonomic_by_stage` fills `nights[].autonomic` for the web; iOS and Android recompute
-(`Sleep.autonomic` in Swift and Kotlin) from their on-device hypnogram since that FFI field is
-null under `NoModelRunner`. One deliberate difference: the web maps each HRV/HR sample to a
-stage by its **true timestamp** (`hrv_event` gives `interval_min`-spaced samples), while the
-native clients only have the even-spread downsampled `series`, so they align by **index
-fraction** — the two can differ by a hair. We expose per-stage means (esp. deep-sleep HRV) rather than an overnight HRV "slope":
+(`Sleep.autonomic(night:stages:)` / `Sleep.autonomic(night, stages)`) because the on-device
+hypnogram can differ from the core's. All three now place each sample by its **true
+timestamp** (`nights[].series_t`); the core's precomputed `autonomic`, then the old
+index-fraction method over `series`, are fallbacks for summaries without `series_t`. We expose per-stage means (esp. deep-sleep HRV) rather than an overnight HRV "slope":
 nocturnal HRV is stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery —
 which is why Oura's own app has no per-night HRV trend either.
 
@@ -210,9 +217,9 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   export of workouts (add/remove as detections change), sleep stages, heart rate, HRV,
   resting HR, steps, calories, and distance.
 
-### Android-only, not yet on iOS or web
+### Android-only, not yet on iOS
 
-- **Live heart rate** (`ui/heartrate/`): streams beat-by-beat bpm/IBI from the worn ring via
+- **Live heart rate** (`ui/heartrate/`; the web has its own `POST /api/live-hr` panel): streams beat-by-beat bpm/IBI from the worn ring via
   `RingSession.live_heart_rate` in `oura-core`, which wraps oura-link's `live_heart_rate`
   (daytime HR in `CONNECTED_LIVE` mode). iOS can call the same UniFFI method from
   `RingSync.swift`; the web dashboard would need an endpoint over `oura live-hr`'s client
@@ -223,6 +230,19 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   per-beat average. `SignalQuality.kt` hides the number as "weak signal" when accepted beats
   cover < 60% of the last 15 s: with poor contact the ring's few locked beats are wrong, not
   just noisy (143 vs a watch's 72). Threshold calibrated on Ring 5 captures.
+
+### Not yet on Android
+
+- **Sleep staging fixes for Gen 4 rings** (iOS `SleepStaging.nightInputs`: separate 0x60/0x80
+  beats with quality gating, synthetic beats from 0x5d, 0x75 temperature, end-time epoch
+  alignment `Sleep.alignedStages`, `estimateStages` fallback, `refineDeepStages`) and the
+  matching `torch_bridge` timestamps output — `models/SleepStaging.kt` is the old pipeline.
+- **Ring clock dating rules** (0x85 RTC beacons, 0x41 `ring_start`, stalls, undated data) in
+  `data/EventStore.kt`; the on-device models still use the older 0x42-only mapping.
+- **Activity model resilience** (never abort on one bad day, failed-day cache, MET dedup).
+- **Pair a factory-reset ring / factory reset** (`RingSession.pair`, `factory_reset`).
+- **Per-day "Refresh analysis"** buttons; the full flavor reruns models through its cache.
+- **Battery history chart** (web-only upstream too; the field is decoded on Android).
 
 ### Android-specific divergences (deliberate, not bugs)
 
