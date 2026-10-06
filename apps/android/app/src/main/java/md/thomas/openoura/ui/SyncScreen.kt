@@ -47,7 +47,9 @@ import androidx.compose.ui.unit.sp
 import md.thomas.openoura.ble.BlePermissions
 import md.thomas.openoura.ble.RingSync
 import md.thomas.openoura.diag.Diagnostics
+import md.thomas.openoura.data.clockReport
 import md.thomas.openoura.store.RingKeyStore
+import md.thomas.openoura.store.SummaryCache
 import md.thomas.openoura.store.isValidRingKey
 
 /**
@@ -238,6 +240,21 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
                 ActionRowInline("copy all") { copyDiagnostics(context) }
             }
             if (showDiagnostics) {
+                // Per-boot ring clock table from the last summary (anchors, undated nights).
+                val clock = remember { clockReport(SummaryCache.load(context)?.clock) }
+                clock?.let {
+                    Text("ring clock", fontFamily = Obs.mono, fontSize = 11.sp, color = colors.ink2)
+                    Text(
+                        it,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(colors.rule.copy(alpha = 0.25f), RoundedCornerShape(6.dp))
+                            .padding(10.dp),
+                        fontFamily = Obs.mono,
+                        fontSize = 10.sp,
+                        color = colors.ink2,
+                    )
+                }
                 val crashes = remember { Diagnostics.previousCrashes(context) }
                 if (crashes.isNotEmpty()) {
                     Text(
@@ -329,6 +346,9 @@ private fun copyDiagnostics(context: Context) {
         "── ${it.name} ──\n${it.readText()}"
     }
     val text = buildString {
+        clockReport(SummaryCache.load(context)?.clock)?.let {
+            append("══ ring clock ══\n").append(it).append("\n\n")
+        }
         append(Diagnostics.transcript())
         if (crashes.isNotEmpty()) {
             append("\n\n══ previous crashes ══\n")

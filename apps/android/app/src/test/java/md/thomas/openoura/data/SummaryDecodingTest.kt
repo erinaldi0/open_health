@@ -134,4 +134,18 @@ class SummaryDecodingTest {
         assertEquals("MINOR_SIGNS", Summary(illness = model, symptoms = core).symptomRadar!!.status)
         assertEquals("NO_SIGNS", Summary(illness = model.copy(available = false), symptoms = core).symptomRadar!!.status)
     }
+
+    @Test
+    fun `clock report lists boots, undated nights and warnings`() {
+        val clock = ClockDiag(
+            epochs = listOf(ClockEpoch(minDs = 1, maxDs = 9, spanH = 2.5, anchors = 2, anchorSources = listOf("phone"), captureMin = 0, captureMax = 86_400)),
+            warnings = listOf("1 night could not be dated"),
+            undatedNights = listOf(UndatedNight(startDs = 5, endDs = 7, inBedH = 7.5, source = "ring")),
+        )
+        val text = clockReport(clock, java.time.ZoneOffset.UTC)!!.lines()
+        assertEquals("boot 1: ds 1…9 (2.5h) synced 1970-01-01 00:00…1970-01-02 00:00 anchors=2 [phone] latest=–", text[0])
+        assertEquals("undated night: ds 5…7 7.5h captured – (ring)", text[1])
+        assertEquals("warning: 1 night could not be dated", text[2])
+        assertEquals(null, clockReport(ClockDiag()))
+    }
 }

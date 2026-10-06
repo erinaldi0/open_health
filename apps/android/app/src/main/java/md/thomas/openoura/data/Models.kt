@@ -613,3 +613,31 @@ internal fun clockLabel(hour: Double): String {
     val totalMinutes = Math.round(hour * 60).toInt()
     return "%02d:%02d".format((totalMinutes / 60) % 24, totalMinutes % 60)
 }
+
+/**
+ * Plain-text ring-clock report: one line per boot (ds range, sync window, anchors), each
+ * undated night, and the warnings. Shown under Sync diagnostics and included in the copied
+ * report. Mirrors iOS `ClockReport.text()`.
+ */
+fun clockReport(clock: ClockDiag?, zone: java.time.ZoneId = java.time.ZoneId.systemDefault()): String? {
+    clock ?: return null
+    val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(zone)
+    fun day(unix: Long?) = unix?.let { fmt.format(java.time.Instant.ofEpochSecond(it)) } ?: "–"
+    val lines = ArrayList<String>()
+    clock.epochs.forEachIndexed { i, e ->
+        val sources = e.anchorSources.orEmpty().joinToString(",")
+        lines.add(
+            "boot ${i + 1}: ds ${e.minDs ?: 0}…${e.maxDs ?: 0} (${e.spanH ?: 0.0}h) " +
+                "synced ${day(e.captureMin)}…${day(e.captureMax)} anchors=${e.anchors ?: 0}" +
+                (if (sources.isEmpty()) "" else " [$sources]") + " latest=${day(e.latestAnchorUnix)}"
+        )
+    }
+    for (n in clock.undatedNights) {
+        lines.add(
+            "undated night: ds ${n.startDs ?: 0}…${n.endDs ?: 0} ${n.inBedH ?: 0.0}h " +
+                "captured ${day(n.capturedUnix)} (${n.source ?: "?"})"
+        )
+    }
+    clock.warnings.mapTo(lines) { "warning: $it" }
+    return lines.takeIf { it.isNotEmpty() }?.joinToString("\n")
+}

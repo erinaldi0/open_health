@@ -1,6 +1,10 @@
 package md.thomas.openoura.ui
 
 import android.app.TimePickerDialog
+import android.widget.Toast
+import android.content.Intent
+import android.content.ClipboardManager
+import android.content.ClipData
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -17,6 +21,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -39,7 +45,10 @@ import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.core.content.FileProvider
+import md.thomas.openoura.ble.RingSync
 import md.thomas.openoura.data.BedtimeOverrideStore
+import md.thomas.openoura.data.DayExport
 import md.thomas.openoura.store.DB
 import md.thomas.openoura.data.NightRow
 import md.thomas.openoura.data.Sleep
@@ -109,6 +118,7 @@ fun DayReportScreen(
             )
             Text(day, fontFamily = Obs.mono, fontSize = 13.sp, color = colors.muted)
             Spacer(Modifier.weight(1f))
+            DayExportMenu(s, day, sleep)
             Segmented(
                 options = listOf("Sleep", "Activity"),
                 selectedIndex = if (sleep) 0 else 1,
@@ -595,3 +605,58 @@ private fun overrideFiles(context: android.content.Context): List<java.io.File> 
     java.io.File(java.io.File(DB.readPath(context)).parentFile, BedtimeOverrideStore.FILE),
     java.io.File(DB.file(context).parentFile, BedtimeOverrideStore.FILE),
 )
+
+/**
+ * "export" → copy or share the open tab as JSON (`DayExport`). Same sections and keys as
+ * iOS `DayReportView`'s export menu and the web's "Export JSON".
+ */
+@Composable
+private fun DayExportMenu(s: Summary, day: String, sleep: Boolean) {
+    val colors = Obs.colors
+    val context = LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    fun payload(): DayExport? = DayExport.build(s, day, sleep, appVersion(context)).takeUnless { it.isEmpty }
+    Box {
+        Text(
+            "export",
+            modifier = Modifier.clickable { open = true },
+            fontFamily = Obs.mono,
+            fontSize = 12.sp,
+            color = colors.link,
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(text = { Text("Copy JSON") }, onClick = {
+                open = false
+                payload()?.let { export ->
+                    val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText(export.fileName, export.json()))
+                } ?: Toast.makeText(context, "Nothing to export for this day.", Toast.LENGTH_SHORT).show()
+            })
+            DropdownMenuItem(text = { Text("Share file") }, onClick = {
+                open = false
+                val export = payload()
+                if (export == null) {
+                    Toast.makeText(context, "Nothing to export for this day.", Toast.LENGTH_SHORT).show()
+                    return@DropdownMenuItem
+                }
+                val dir = java.io.File(context.cacheDir, RingSync.EXPORT_DIR).apply { mkdirs() }
+                val file = java.io.File(dir, export.fileName).apply { writeText(export.json()) }
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "application/json"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, export.fileName)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(send, "Export ${export.kind}"))
+            })
+        }
+    }
+}
+
+private fun appVersion(context: android.content.Context): String = try {
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    "${info.versionName} (${androidx.core.content.pm.PackageInfoCompat.getLongVersionCode(info)})"
+} catch (_: Exception) {
+    "?"
+}
