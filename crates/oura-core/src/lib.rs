@@ -539,20 +539,73 @@ impl RingSession {
             .map_err(|e| fail(e.to_string()))?;
 
         listener.on_status("live".into());
-        let duration = std::time::Duration::from_secs(max_seconds.into());
-        let streamed = tokio::select! {
-            r = client.live_heart_rate(duration, false, |s| listener.on_sample(s.bpm, s.ibi_ms)) => r,
-            _ = self.stop_live.notified() => Ok(()),
+        // The stream is driven here rather than through oura-link's `live_heart_rate`,
+        // which only sets CONNECTED_LIVE. The ring then accepts the mode but sends no
+        // beats: it also needs DAYTIME_HR's subscription set to LATEST (`2f 03 26 02 02`),
+        // which the upstream helper omits. Collecting in-crate also lets a stop end the
+        // loop cleanly instead of dropping a foreign future.
+        let mut rx = self.tx.subscribe();
+        while rx.try_recv().is_ok() {} // drop auth/setup replies
+        let started = async {
+            client
+                .transport()
+                .write(&protocol::req_set_feature_mode(
+                    feature::DAYTIME_HR,
+                    feature_mode::CONNECTED_LIVE,
+                ))
+                .await?;
+            client
+                .transport()
+                .write(&protocol::req_param_write_byte2(
+                    feature::DAYTIME_HR,
+                    protocol::subscription_mode::LATEST,
+                ))
+                .await
+        }
+        .await;
+
+        let streamed = match started {
+            Err(e) => Err(e),
+            Ok(()) => {
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(max_seconds.into());
+                loop {
+                    tokio::select! {
+                        _ = self.stop_live.notified() => break Ok(()),
+                        _ = tokio::time::sleep_until(deadline) => break Ok(()),
+                        frame = rx.recv() => match frame {
+                            Ok(frame) => {
+                                if let Some((bpm, ibi_ms)) = parse_live_hr_frame(&frame) {
+                                    listener.on_sample(bpm, ibi_ms);
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                        },
+                    }
+                }
+            }
         };
-        // oura-link restores AUTOMATIC itself only when its loop runs to the end; a stop
-        // drops it mid-stream, so restore here unconditionally (it is idempotent).
-        let restored = client
-            .transport()
-            .write(&protocol::req_set_feature_mode(
-                feature::DAYTIME_HR,
-                feature_mode::AUTOMATIC,
-            ))
-            .await;
+
+        // Always put the ring back: daytime HR to AUTOMATIC and its subscription to OFF,
+        // the stock state (`2f06210201000000`: mode 1, subscription 0). Both idempotent.
+        let restored = async {
+            client
+                .transport()
+                .write(&protocol::req_set_feature_mode(
+                    feature::DAYTIME_HR,
+                    feature_mode::AUTOMATIC,
+                ))
+                .await?;
+            client
+                .transport()
+                .write(&protocol::req_param_write_byte2(
+                    feature::DAYTIME_HR,
+                    protocol::subscription_mode::OFF,
+                ))
+                .await
+        }
+        .await;
         streamed.map_err(|e| fail(e.to_string()))?;
         restored.map_err(|e| fail(e.to_string()))
     }
@@ -920,6 +973,21 @@ fn to_hex(key: &[u8; 16]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// One beat from a daytime-HR live notification (`2f .. 28 02 ..`): bytes 8–9 hold a
+/// 12-bit IBI (ms) with a 4-bit lock flag on top. Only flag 1 (good pulse lock) is a beat
+/// worth showing; on Ring 5 captures the other flags came with poor contact and wrong
+/// intervals. Same rule as oura-link's private `parse_live_hr_frame`.
+fn parse_live_hr_frame(frame: &[u8]) -> Option<(u16, u16)> {
+    if frame.len() < 10 || frame[0] != 0x2f || frame[2] != 0x28 || frame[3] != feature::DAYTIME_HR {
+        return None;
+    }
+    let ibi_ms = (((frame[9] & 0x0f) as u16) << 8) | frame[8] as u16;
+    if (frame[9] >> 4) != 1 || !(300..=2000).contains(&ibi_ms) {
+        return None;
+    }
+    Some(((60_000u32 / ibi_ms as u32) as u16, ibi_ms))
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1050,6 +1118,18 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_live_hr_frames_from_a_ring5_capture() {
+        // 0x27d = 637 ms, lock flag 1 → 94 bpm
+        let good = [0x2f, 0x0f, 0x28, 0x02, 0x09, 0x02, 0, 0, 0x7d, 0x12, 0, 0, 0, 0, 1, 0x0a, 0x7f];
+        assert_eq!(parse_live_hr_frame(&good), Some((94, 637)));
+        // flag 2 (no lock) and the 2000 ms cap with flag 2 are not beats
+        let unlocked = [0x2f, 0x0f, 0x28, 0x02, 0x09, 0x02, 0, 0, 0x28, 0x23, 0, 0, 0, 0, 1, 0x0a, 0x7f];
+        assert_eq!(parse_live_hr_frame(&unlocked), None);
+        // the mode-change reply is not a sample
+        assert_eq!(parse_live_hr_frame(&[0x2f, 0x03, 0x23, 0x02, 0x00]), None);
     }
 
     #[test]
