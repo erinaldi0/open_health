@@ -25,7 +25,7 @@ import kotlin.math.roundToLong
  */
 object ActivityModel {
 
-    private const val AAD_MODEL = "automatic_activity_detection_3_1_11"
+    private const val AAD_MODEL = "automatic_activity_detection_3_1_12"
     private const val STEP_MODEL = "steps_motion_decoder_2_0_0"
 
     private val BEHAVIOR = mapOf(

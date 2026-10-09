@@ -29,17 +29,17 @@ OUT = MODELS / "mobile"
 
 # newest version per family (same list as inspect_models.py)
 NEWEST = [
-    "automatic_activity_detection_3_1_11",
-    "atlas_2_1_0",
+    "automatic_activity_detection_3_1_12",
+    "atlas_3_0_0",
     "awhr_imputation_1_2_0",
     "awhr_profile_selector_1_0_1",
-    "cumulative_stress_1_2_2",
-    "cva_2_1_0",
+    "cumulative_stress_2_0_0",
+    "cva_2_1_5",
     "cva_calibrator_1_3_0",
     "daily_medians_1_1_0",
     "daily_short_term_baselines_1_1_0",
     "dhrv_imputation_1_1_0",
-    "energy_expenditure_1_0_0",
+    "energy_expenditure_2_4_1",
     "halite_1_2_0",
     "illness_detection_0_5_1",
     "insomnia_0_1_4",
@@ -52,8 +52,8 @@ NEWEST = [
     "step_counter_1_3_0",
     "steps_motion_decoder_2_0_0",
     "stress_daytime_sensing_1_1_0",
-    "stress_resilience_2_2_1",
-    "training_stress_score_0_2_1",
+    "stress_resilience_2_2_2",
+    "training_stress_score_0_2_2",
     "whr_2_7_1",
 ]
 

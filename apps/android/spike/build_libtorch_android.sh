@@ -68,8 +68,15 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5   # cmake 4.x compat for old submodules
 # non-x86_64 Linux host it cannot even find the NDK's unified sysroot. The shim NDK
 # solves both: CMake picks "the NDK's" compiler by its own rules, and that compiler is a
 # wrapper around the host's native clang. See android_cmake_ndk in android-env.sh.
-SHIM_NDK="$(ANDROID_NDK_SHIM="$ROOT/ndk-shim" android_cmake_ndk)"
-echo "==> shim NDK: $SHIM_NDK (host compiler: $HOST_CC)"
+# On macOS the NDK ships universal binaries and works directly; shim is only needed on
+# non-x86_64 Linux.
+if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" != "x86_64" ]; then
+    SHIM_NDK="$(ANDROID_NDK_SHIM="$ROOT/ndk-shim" android_cmake_ndk)"
+    echo "==> shim NDK: $SHIM_NDK (host compiler: $HOST_CC)"
+else
+    SHIM_NDK="$ANDROID_NDK_HOME"
+    echo "==> using real NDK: $SHIM_NDK (host compiler: $HOST_CC)"
+fi
 
 echo "==> cmake configure (Android $ABI / lite interpreter / CPU)"
 cmake -GNinja -S . -B "$BUILDDIR" \

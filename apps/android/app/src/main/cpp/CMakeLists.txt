@@ -46,6 +46,9 @@ if(NOT EXISTS "${LIBTORCH}/lib/libtorch_cpu.a")
     message(FATAL_ERROR "libtorch_cpu.a missing from ${LIBTORCH}/lib — the build did not finish")
 endif()
 
+# 16KB page alignment for Android 14+ (API 34+)
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384")
+
 # torch_cpu carries the operator registrations the lite interpreter looks up by name at
 # runtime. They look unreferenced to the linker, so without --whole-archive they are
 # dropped and the models load and then fail with "unknown builtin op". The rest are
