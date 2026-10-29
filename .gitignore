@@ -47,6 +47,7 @@ tools/frida/*.compiled.js
 # Runtime state the CLI writes next to the DB (personal profile, ring feature modes).
 profile.json
 feature_modes.json
+nssa_cache.json
 
 # Python research/test bytecode
 __pycache__/

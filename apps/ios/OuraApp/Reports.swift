@@ -161,6 +161,31 @@ enum Sleep {
                               hrDeep: h[1], hrLight: h[2], hrRem: h[3])
     }
 
+    /// Hypnograms from Oura's own staging (NSSA or the ring) are shown verbatim.
+    /// Mirrors `oura-summary::is_oura_staging`.
+    static func isOuraStaging(_ source: String?) -> Bool { source == "nssa" || source == "ring" }
+
+    /// Android SleepPhaseConverter.aggregate30SecTo5Min: drop codes outside 1...4, cut
+    /// into 10-epoch windows (last partial), skip windows < 5, AWAKE when >= 4 awake,
+    /// else the most frequent stage, ties AWAKE > DEEP > REM > LIGHT.
+    /// Mirrors `oura-summary::aggregate_30s_to_5min`.
+    static func aggregate5Min(_ stages: [Int]) -> [Int] {
+        let codes = stages.filter { (1...4).contains($0) }
+        var out: [Int] = []
+        var i = 0
+        while i < codes.count {
+            let w = codes[i..<min(i + 10, codes.count)]
+            i += 10
+            if w.count < 5 { continue }
+            var counts = [0, 0, 0, 0, 0]
+            for c in w { counts[c] += 1 }
+            if counts[4] >= 4 { out.append(4); continue }
+            let top = counts[1...4].max() ?? 0
+            out.append([4, 1, 3, 2].first { counts[$0] >= top } ?? 4)
+        }
+        return out
+    }
+
     /// Mode filter over a centered odd window — removes single-epoch flicker so cycle /
     /// awakening counts reflect real architecture, not 30 s noise.
     static func smooth(_ v: [Int], _ win: Int) -> [Int] {
@@ -266,7 +291,7 @@ enum Sleep {
         guard spanS > 0 else { return nil }
         let stepS = spanS / Double(n)
 
-        func interpolate(_ pts: [[Double]], fallback: [Double], maxHoldS: Double) -> [Double?] {
+        func interpolate(_ pts: [[Double]], fallback: [Double]) -> [Double?] {
             var pairs: [(Double, Double)] = pts.compactMap { p in
                 guard p.count >= 2, p[0].isFinite, p[1].isFinite, p[1] > 0 else { return nil }
                 return (p[0], p[1])
@@ -281,25 +306,35 @@ enum Sleep {
             guard !pairs.isEmpty else { return Array(repeating: nil, count: n) }
             pairs.sort { $0.0 < $1.0 }
             var out = Array(repeating: Double?.none, count: n)
-            var cursor = 0
+            var lo = 0
             for idx in 0..<n {
                 let center = startS + (Double(idx) + 0.5) * stepS
-                while cursor + 1 < pairs.count && pairs[cursor + 1].0 <= center {
-                    cursor += 1
+                if center <= pairs[0].0 {
+                    out[idx] = pairs[0].1
+                    continue
                 }
-                var best = pairs[cursor]
-                if cursor + 1 < pairs.count, abs(pairs[cursor + 1].0 - center) < abs(best.0 - center) {
-                    best = pairs[cursor + 1]
+                if center >= pairs[pairs.count - 1].0 {
+                    out[idx] = pairs[pairs.count - 1].1
+                    continue
                 }
-                if abs(best.0 - center) <= maxHoldS {
-                    out[idx] = best.1
+                while lo + 1 < pairs.count && pairs[lo + 1].0 <= center {
+                    lo += 1
+                }
+                let hi = min(lo + 1, pairs.count - 1)
+                let (t0, v0) = pairs[lo]
+                let (t1, v1) = pairs[hi]
+                if t1 <= t0 {
+                    out[idx] = v0
+                } else {
+                    let f = (center - t0) / (t1 - t0)
+                    out[idx] = v0 * (1.0 - f) + v1 * f
                 }
             }
             return out
         }
 
-        let hr = interpolate(night.series_t?.hr ?? [], fallback: night.series?.hr ?? [], maxHoldS: 450)
-        let hrv = interpolate(night.series_t?.hrv ?? [], fallback: night.series?.hrv ?? [], maxHoldS: 450)
+        let hr = interpolate(night.series_t?.hr ?? [], fallback: night.series?.hr ?? [])
+        let hrv = interpolate(night.series_t?.hrv ?? [], fallback: night.series?.hrv ?? [])
         var motion = Array(repeating: 0.0, count: n)
         if let timedMotion = night.series_t?.motion, !timedMotion.isEmpty {
             for p in timedMotion where p.count >= 2 && p[0].isFinite && p[1].isFinite {
@@ -323,10 +358,12 @@ enum Sleep {
 
     /// Recover physiological N3 (Deep) bouts when Oura Gen 4 sparse IBI streams cause
     /// SleepNet to collapse N3 into N2 (0% Deep across a full night). Mirrors
-    /// `oura-summary::refine_deep_stages`.
+    /// `oura-summary::refine_deep_stages_with_hrv`.
     static func refineDeepStages(stages: [Int], night: NightRow) -> [Int] {
         let n = stages.count
+        let rawHRCount = max(night.series_t?.hr.count ?? 0, night.series?.hr.count ?? 0)
         guard n >= 40,
+              rawHRCount >= 6,
               stages.allSatisfy({ (1...4).contains($0) }),
               !stages.contains(1),
               stages.filter({ $0 == 2 }).count >= 20,
@@ -335,62 +372,141 @@ enum Sleep {
         }
         let hrValid = grid.hr.compactMap { $0 }
         guard hrValid.count >= 6 else { return stages }
-        let hrQ35 = percentile(hrValid, 0.35)
-        let hrQ50 = percentile(hrValid, 0.50)
+        let hrMed = percentile(hrValid, 0.50)
+        let hrEp: [Double] = grid.hr.map { $0 ?? hrMed }
+        if let minHR = hrEp.min(), let maxHR = hrEp.max(), maxHR - minHR < 2.0 {
+            return stages
+        }
         let hrvValid = grid.hrv.compactMap { $0 }
-        let hrvQ45 = hrvValid.count >= 4 ? percentile(hrvValid, 0.45) : 0.0
-        let posMotion = grid.motion.filter { $0 > 0 }
-        let quietMotion = posMotion.isEmpty ? 2.0 : max(2.0, min(6.0, percentile(posMotion, 0.35)))
+        let hrvMed = hrvValid.isEmpty ? 0.0 : percentile(hrvValid, 0.50)
+        let hrvEp: [Double] = grid.hrv.map { $0 ?? hrvMed }
 
-        let candidates: [Bool] = (0..<n).map { idx in
-            guard stages[idx] == 2 else { return false }
-            let frac = Double(idx) / Double(max(1, n - 1))
-            guard frac <= 0.78, grid.motion[idx] <= quietMotion else { return false }
-            let lo = max(0, idx - 3), hi = min(n, idx + 4)
-            guard !(lo..<hi).contains(where: { stages[$0] == 4 || stages[$0] == 3 }),
-                  let h = grid.hr[idx] else { return false }
-            let hCap = frac <= 0.55 ? hrQ50 : hrQ35
-            guard h <= hCap + 0.5 else { return false }
-            let hrs = (lo..<hi).compactMap { grid.hr[$0] }
-            if hrs.count >= 3 {
-                let mean = hrs.reduce(0, +) / Double(hrs.count)
-                let variance = hrs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(hrs.count)
-                if variance.squareRoot() > 3.2 { return false }
-            }
-            if hrvQ45 > 0, let v = grid.hrv[idx], v < hrvQ45 * 0.75 && h > hrQ35 {
-                return false
-            }
-            return true
+        let localHR: [Double] = (0..<n).map { i in
+            let lo = max(0, i - 90), hi = min(n, i + 91)
+            return hrEp[lo..<hi].reduce(0, +) / Double(max(1, hi - lo))
         }
 
-        var smoothed = candidates
-        if n >= 3 {
-            for idx in 1..<(n - 1) {
-                if !smoothed[idx] && candidates[idx - 1] && candidates[idx + 1] && stages[idx] == 2 {
-                    smoothed[idx] = true
-                }
-            }
-        }
-        var refined = stages
-        let maxDeep = max(8, Int((Double(n) * 0.24).rounded()))
-        var assigned = 0
+        let sleepIndices = stages.enumerated().compactMap { (1...3).contains($0.element) ? $0.offset : nil }
+        guard sleepIndices.count >= 20 else { return stages }
+        let onset = sleepIndices.first ?? 0
+        let finalSleep = sleepIndices.last ?? max(0, n - 1)
+        let sleepSpan = Double(max(1, finalSleep - onset))
+
+        var runs: [(Int, Int)] = []
         var idx = 0
         while idx < n {
-            if smoothed[idx] {
-                var end = idx + 1
-                while end < n && smoothed[end] { end += 1 }
-                if end - idx >= 6 {
-                    for j in idx..<end where assigned < maxDeep {
-                        refined[j] = 1
-                        assigned += 1
-                    }
-                }
-                idx = end
+            if stages[idx] == 2 && grid.motion[idx] <= 1.0 {
+                var j = idx
+                while j < n && stages[j] == 2 && grid.motion[j] <= 1.0 { j += 1 }
+                if j - idx >= 12 { runs.append((idx, j)) }
+                idx = j
             } else {
                 idx += 1
             }
         }
-        return refined
+        guard !runs.isEmpty else { return stages }
+
+        var segmentedRuns: [(Int, Int)] = []
+        for (rStart, rEnd) in runs {
+            if rEnd - rStart <= 180 {
+                segmentedRuns.append((rStart, rEnd))
+            } else {
+                var cur = rStart
+                while cur + 12 <= rEnd {
+                    var segEnd = min(rEnd, cur + 90)
+                    if rEnd - segEnd < 24 { segEnd = rEnd }
+                    segmentedRuns.append((cur, segEnd))
+                    cur = segEnd
+                }
+            }
+        }
+
+        let firstCycleMaxLen = segmentedRuns.compactMap { s, e -> Int? in
+            let frac = (Double(s + e) / 2.0 - Double(onset)) / sleepSpan
+            return frac < 0.16 ? (e - s) : nil
+        }.max() ?? 0
+
+        var scoredRuns: [(score: Double, start: Int, end: Int, frac: Double, dip: Double)] = []
+        for (rStart, rEnd) in segmentedRuns {
+            let runLen = rEnd - rStart
+            let mid = Double(rStart + rEnd) / 2.0
+            let sleepFrac = max(0.0, (mid - Double(onset)) / sleepSpan)
+            if sleepFrac > 0.56 { continue }
+            if sleepFrac < 0.12 && firstCycleMaxLen >= 40 && Double(runLen) < Double(firstCycleMaxLen) * 0.65 {
+                continue
+            }
+            let meanHR = hrEp[rStart..<rEnd].reduce(0, +) / Double(runLen)
+            let meanLocHR = localHR[rStart..<rEnd].reduce(0, +) / Double(runLen)
+            let prevEnd = max(1, rStart)
+            let prevHR = hrEp[0..<prevEnd].reduce(0, +) / Double(prevEnd)
+            let meanHRV = hrvValid.isEmpty ? 0.0 : hrvEp[rStart..<rEnd].reduce(0, +) / Double(runLen)
+            let hrDip = meanLocHR - meanHR
+            let prevDip = prevHR - meanHR
+            if prevDip < -0.25 || (prevDip < 0.10 && hrDip < 0.35) {
+                continue
+            }
+            if !hrvValid.isEmpty && sleepFrac > 0.12 && meanHRV > max(38.0, hrvMed * 1.15) && hrDip < 2.0 {
+                continue
+            }
+            let homeo = exp(-2.2 * sleepFrac)
+            let durBonus = min(1.0, max(0.0, Double(runLen - 12) / 48.0))
+            let dipBonus = min(0.6, max(-0.5, hrDip / 3.0))
+            let score = homeo * 0.55 + durBonus * 0.35 + dipBonus * 0.25
+            scoredRuns.append((score, rStart, rEnd, sleepFrac, hrDip))
+        }
+
+        scoredRuns.sort { $0.score > $1.score }
+        let asleepEpochs = sleepIndices.count
+        let targetDeep = max(12, Int((Double(asleepEpochs) * 0.105).rounded()))
+        var out = stages
+        var selectedCenters: [Int] = []
+        var deepCount = 0
+
+        for item in scoredRuns {
+            if deepCount >= targetDeep { break }
+            let rStart = item.start, rEnd = item.end, sleepFrac = item.frac
+            let runLen = rEnd - rStart
+            let mid = (rStart + rEnd) / 2
+            if selectedCenters.contains(where: { abs(mid - $0) < 110 }) { continue }
+            let remaining = targetDeep - deepCount
+            if remaining < 8 { break }
+
+            let sIdx: Int
+            let eIdx: Int
+            if sleepFrac < 0.16 {
+                let lead = rStart <= onset + 12 ? 2 : min(10, max(2, (runLen - 12) / 5))
+                let tail = min(4, max(1, (runLen - 12 - lead) / 6))
+                let maxBout = min(56, max(0, runLen - lead - tail), remaining)
+                if maxBout < 8 { continue }
+                let searchEnd = max(rStart + lead, rEnd - tail - maxBout)
+                var bestS = rStart + lead
+                var bestHR = Double.infinity
+                for candS in (rStart + lead)...searchEnd {
+                    let mHR = hrEp[candS..<(candS + maxBout)].reduce(0, +) / Double(maxBout)
+                    if mHR < bestHR {
+                        bestHR = mHR
+                        bestS = candS
+                    }
+                }
+                sIdx = bestS
+                eIdx = bestS + maxBout
+            } else if sleepFrac < 0.36 {
+                let cap = item.dip >= 2.0 ? min(42, max(10, (runLen * 9) / 20)) : min(26, max(10, (runLen * 2) / 5))
+                let maxBout = min(cap, min(remaining, runLen))
+                let tail = min(4, max(1, (runLen - maxBout) / 4))
+                eIdx = rEnd - tail
+                sIdx = max(rStart + min(4, runLen), eIdx - maxBout)
+            } else {
+                let maxBout = min(min(22, max(8, (runLen * 2) / 5)), min(remaining, runLen))
+                sIdx = rStart + (runLen - maxBout) / 2
+                eIdx = sIdx + maxBout
+            }
+            if eIdx <= sIdx || eIdx - sIdx < 8 { continue }
+            for k in sIdx..<eIdx { out[k] = 1 }
+            deepCount += eIdx - sIdx
+            selectedCenters.append((sIdx + eIdx) / 2)
+        }
+        return out
     }
 
     /// Physiological 4-stage hypnogram estimator when Torch SleepNet cannot run on a night
@@ -404,61 +520,86 @@ enum Sleep {
             spanS = night.durationS
         }
         let n = Int((spanS / 30.0).rounded())
-        guard (40...1920).contains(n),
+        let rawHRCount = max(night.series_t?.hr.count ?? 0, night.series?.hr.count ?? 0)
+        guard (120...1920).contains(n),
+              rawHRCount >= 12,
               let grid = epochSignalGrid(night: night, count: n) else { return nil }
         let hrValid = grid.hr.compactMap { $0 }
         let hrvValid = grid.hrv.compactMap { $0 }
-        guard hrValid.count >= 6 || hrvValid.count >= 6 else { return nil }
+        guard hrValid.count >= 12 else { return nil }
 
-        let hrQ35 = hrValid.isEmpty ? 58.0 : percentile(hrValid, 0.35)
-        let hrQ65 = hrValid.isEmpty ? 64.0 : percentile(hrValid, 0.65)
-        let hrQ85 = hrValid.isEmpty ? 70.0 : percentile(hrValid, 0.85)
-        let hrvQ35 = hrvValid.isEmpty ? 30.0 : percentile(hrvValid, 0.35)
-        let hrvQ65 = hrvValid.isEmpty ? 50.0 : percentile(hrvValid, 0.65)
-        let posMotion = grid.motion.filter { $0 > 0 }
-        let wakeMotion = posMotion.isEmpty ? 12.0 : max(8.0, percentile(posMotion, 0.85))
-        let quietMotion = posMotion.isEmpty ? 2.0 : max(2.0, min(5.0, percentile(posMotion, 0.30)))
-
-        var rawStages = Array(repeating: 2, count: n)
-        for idx in 0..<n {
-            let frac = Double(idx) / Double(max(1, n - 1))
-            let m = grid.motion[idx]
-            let h = grid.hr[idx]
-            let v = grid.hrv[idx]
-            let edge = idx < 6 || idx + 6 >= n
-
-            let lo = max(0, idx - 3), hi = min(n, idx + 4)
-            let hrs = (lo..<hi).compactMap { grid.hr[$0] }
-            let hrStd: Double = {
-                guard hrs.count >= 3 else { return 1.5 }
-                let mean = hrs.reduce(0, +) / Double(hrs.count)
-                return (hrs.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(hrs.count)).squareRoot()
-            }()
-
-            if m >= wakeMotion || (edge && m > quietMotion) || ((h ?? 0) >= hrQ85 + 2.0 && m > quietMotion) {
-                rawStages[idx] = 4
-                continue
-            }
-            let cyclePhase = sin(2.0 * .pi * (spanS * frac / 5400.0 - 0.25))
-            if frac >= 0.12 && m <= quietMotion * 1.5 && (hrStd >= 2.0 || (cyclePhase > 0.35 && (h ?? hrQ65) >= hrQ35)) {
-                if let v, v >= hrvQ65 && (h ?? hrQ65) > hrQ35 {
-                    rawStages[idx] = 3
-                    continue
-                } else if hrStd >= 2.2 && frac >= 0.20 {
-                    rawStages[idx] = 3
-                    continue
-                }
-            }
-            if frac <= 0.72 && m <= quietMotion && (h ?? (hrQ35 + 1.0)) <= hrQ35 + 0.5 && hrStd <= 2.5 {
-                if (v ?? hrvQ35) >= hrvQ35 * 0.85 {
-                    rawStages[idx] = 1
-                    continue
-                }
-            }
-            rawStages[idx] = 2
+        let hrMed = percentile(hrValid, 0.50)
+        let hrEp: [Double] = grid.hr.map { $0 ?? hrMed }
+        let hrvRawMed = hrvValid.isEmpty ? 0.0 : percentile(hrvValid, 0.50)
+        let hrvRaw: [Double] = grid.hrv.map { $0 ?? hrvRawMed }
+        let hrvEp: [Double] = (0..<n).map { i in
+            let lo = max(0, i - 12), hi = min(n, i + 13)
+            return hrvRaw[lo..<hi].reduce(0, +) / Double(max(1, hi - lo))
         }
-        let smoothed = smooth(rawStages, 5)
-        return refineDeepStages(stages: smoothed, night: night)
+        let hrvMed = hrvValid.isEmpty ? 0.0 : percentile(hrvEp, 0.50)
+        let hrvP62 = hrvValid.isEmpty ? 0.0 : percentile(hrvEp, 0.62)
+        let hrvP80 = hrvValid.isEmpty ? 0.0 : percentile(hrvEp, 0.80)
+
+        var stages = Array(repeating: 2, count: n)
+        var onset = 0
+        let maxOnset = min(n / 4, 120)
+        for i in 0..<maxOnset {
+            let endChk = min(n, i + 10)
+            if (i..<endChk).allSatisfy({ grid.motion[$0] <= 4.0 }) {
+                onset = i
+                break
+            }
+        }
+        for i in 0..<onset { stages[i] = 4 }
+
+        var wakeEnd = n
+        let minWakeEnd = max(onset, n - 90)
+        var foundQuietEnd = false
+        for i in stride(from: n - 1, through: minWakeEnd, by: -1) {
+            let loChk = max(onset, i - 20)
+            if (loChk...i).allSatisfy({ grid.motion[$0] <= 2.0 }) {
+                wakeEnd = i + 1
+                foundQuietEnd = true
+                break
+            }
+        }
+        if !foundQuietEnd {
+            while wakeEnd > minWakeEnd && grid.motion[wakeEnd - 1] >= 4.0 {
+                wakeEnd -= 1
+            }
+        }
+        for i in wakeEnd..<n { stages[i] = 4 }
+
+        for i in onset..<wakeEnd {
+            let loN = max(onset, i - 4), hiN = min(wakeEnd, i + 5)
+            let nearMo = grid.motion[loN..<hiN].reduce(0, +)
+            if grid.motion[i] >= 8.0 || (grid.motion[i] >= 5.0 && nearMo >= 10.0) {
+                let lo = max(onset, i - 1), hi = min(wakeEnd, i + 2)
+                for k in lo..<hi { stages[k] = 4 }
+            }
+        }
+
+        var refined = refineDeepStages(stages: stages, night: night)
+        let remStart = min(wakeEnd, onset + 90)
+        let remEnd = max(remStart, wakeEnd - 2)
+        let sleepSpan = Double(max(1, wakeEnd - onset))
+        for i in remStart..<remEnd {
+            if refined[i] != 2 || grid.motion[i] > 2.0 { continue }
+            let frac = Double(i - onset) / sleepSpan
+            let cyclePos = Double((i - onset) % 176) / 176.0
+            let inRemPhase = (0.56...0.90).contains(cyclePos)
+            let isRem: Bool
+            if !hrvValid.isEmpty && hrvP80 > hrvMed {
+                let hrvV = hrvEp[i]
+                isRem = (inRemPhase && hrvV >= hrvP62)
+                    || (frac >= 0.30 && hrvV >= hrvP80)
+                    || (frac >= 0.80 && inRemPhase && hrvV >= hrvMed * 0.90)
+            } else {
+                isRem = inRemPhase && (frac >= 0.35 || hrEp[i] >= hrMed - 0.5)
+            }
+            if isRem { refined[i] = 3 }
+        }
+        return smooth(refined, 5)
     }
 }
 
@@ -473,7 +614,7 @@ extension Summary {
         for n in nights {
             guard let day = wakeYmd(n) else { continue }
             guard n.stagingComplete else { incompleteDays.insert(day); continue }
-            let actual = Double(Sleep.asleepS(Sleep.smooth(n.hypnogram ?? [], 5),
+            let actual = Double(Sleep.asleepS(n.analysisStages,
                                               inBedS: n.durationS))
             if actual > 0 { byDay[day, default: 0] += actual }
         }
@@ -578,7 +719,7 @@ struct Polysomnograph: View {
     private let laneH: CGFloat = 44
     private let axisH: CGFloat = 18
 
-    private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]? }
+    private struct Lane { let label: String; let unit: String; let signal: SignalLane?; let stages: [Int]?; var stageSpan: [Double]? = nil }
     private struct SignalLane {
         let v: [Double]
         let color: Color
@@ -590,7 +731,14 @@ struct Polysomnograph: View {
 
     private var lanes: [Lane] {
         var out: [Lane] = []
-        if let st = night.hypnogram, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: Sleep.smooth(st, 5))) }
+        // The official app's main chart: 5-minute blocks laid from the first NSSA epoch.
+        if let st5 = night.stages_5min, !st5.isEmpty, let s0 = night.start_unix, let e0 = night.end_unix, e0 > s0 {
+            let t0 = night.stages_t0_unix ?? Double(s0)
+            let span = Double(e0 - s0)
+            let a = (t0 - Double(s0)) / span, b = (t0 + Double(st5.count) * 300 - Double(s0)) / span
+            out.append(Lane(label: "Hypnogram · 5 min (Oura app)", unit: "", signal: nil, stages: st5, stageSpan: [a, b]))
+        }
+        if let st = night.hypnogram, st.count > 1 { out.append(Lane(label: "Hypnogram", unit: "", signal: nil, stages: night.analysisStages)) }
         func sig(_ label: String, _ unit: String, _ v: [Double]?, _ color: Color,
                  _ dp: Int = 0, span: [Double]? = nil, times: [Double]? = nil,
                  rawTimed: [[Double]]? = nil) {
@@ -670,7 +818,7 @@ struct Polysomnograph: View {
             }
             .frame(width: gutterW, alignment: .leading)
             Group {
-                if let st = lane.stages { HypnoCanvas(stages: st) }
+                if let st = lane.stages { HypnoCanvas(stages: st, span: lane.stageSpan) }
                 else if let s = lane.signal { SignalCanvas(v: s.v, color: s.color, span: s.span, times: s.times, timed: s.timed) }
             }
             .frame(width: plotW, height: h)
@@ -679,6 +827,12 @@ struct Polysomnograph: View {
     }
 
     private func gutterValue(_ lane: Lane) -> String {
+        if let st = lane.stages, let sp = lane.stageSpan {
+            guard let f = cursorF else { return "" }
+            guard f >= sp[0], f < sp[1] else { return "—" }
+            let local = (f - sp[0]) / max(1e-9, sp[1] - sp[0])
+            return stageName(st[min(st.count - 1, max(0, Int(local * Double(st.count))))])
+        }
         if let st = lane.stages {
             guard let f = cursorF else { return "" }
             let code = st[min(st.count - 1, max(0, Int(f * Double(st.count - 1))))]
@@ -723,14 +877,19 @@ struct Polysomnograph: View {
 // stepped clinical hypnogram: y = stage level (Awake top → Deep bottom), colored runs.
 private struct HypnoCanvas: View {
     let stages: [Int]
+    /// When set, the stages are blocks spanning [span0, span1] of the night (edge mapping).
+    var span: [Double]? = nil
     var body: some View {
         Canvas { ctx, size in
             let n = stages.count
-            guard n > 1 else { return }
+            guard n > (span == nil ? 1 : 0) else { return }
             let padT: CGFloat = 8, plotH = size.height - 16
             let lvl = { (c: Int) -> CGFloat in switch c { case 1: return 3; case 2: return 2; case 3: return 1; default: return 0 } }
             let yOf = { (l: CGFloat) in padT + l / 3 * plotH }
-            let xOf = { (i: Int) in size.width * CGFloat(i) / CGFloat(n - 1) }
+            let xOf = { (i: Int) -> CGFloat in
+                if let sp = span { return size.width * CGFloat(sp[0] + (sp[1] - sp[0]) * Double(i) / Double(n)) }
+                return size.width * CGFloat(i) / CGFloat(n - 1)
+            }
             for l in 0..<4 {
                 let y = yOf(CGFloat(l))
                 ctx.stroke(Path { $0.move(to: CGPoint(x: 0, y: y)); $0.addLine(to: CGPoint(x: size.width, y: y)) },
@@ -742,7 +901,7 @@ private struct HypnoCanvas: View {
                 if code == 0 { prev = nil; i += 1; continue }
                 var j = i
                 while j < n, stages[j] == code { j += 1 }
-                let x1 = xOf(i), x2 = xOf(min(j, n - 1)), y = yOf(lvl(code))
+                let x1 = xOf(i), x2 = xOf(span == nil ? min(j, n - 1) : j), y = yOf(lvl(code))
                 if let p = prev {
                     ctx.stroke(Path { $0.move(to: CGPoint(x: x1, y: p)); $0.addLine(to: CGPoint(x: x1, y: y)) },
                                with: .color(Obs.trace.opacity(0.6)), lineWidth: 0.8)
@@ -1415,7 +1574,7 @@ struct SleepReport: View {
 
     var body: some View {
         if let n = s.night(forDay: day) {
-            let metrics = (n.hypnogram.flatMap { st in Sleep.metrics(Sleep.smooth(st, 5), inBedS: n.durationS) })
+            let metrics = (n.hypnogram.flatMap { st in Sleep.metrics(Sleep.isOuraStaging(n.staging_source) ? st : Sleep.smooth(st, 5), inBedS: n.durationS) })
             let asleepH = metrics.map { $0.asleepMin / 60 }
 
             // summary strip
@@ -1465,7 +1624,7 @@ struct SleepReport: View {
                 if let m = metrics { clinicalGrid(m) }
 
                 let auto = Sleep.autonomic(night: n,
-                                           stages: Sleep.smooth(n.hypnogram ?? [], 5))
+                                           stages: n.analysisStages)
                 if auto.any {
                     Rule("HR & HRV by stage")
                     autonomicGrid(auto)
