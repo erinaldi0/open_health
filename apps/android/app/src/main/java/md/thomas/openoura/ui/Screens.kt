@@ -356,7 +356,7 @@ fun ProfileScreen(
             NumberField("ring size", ringSize, "us") { ringSize = it; commit() }
 
             Rule("health connect")
-            ActionRow("Import height & weight from Health Connect", onImportHealth)
+            ActionRow("Import height & weight from Health Connect", onClick = onImportHealth)
             Text(
                 // An honest divergence: Health Connect has no date-of-birth or biological-sex
                 // record, so unlike iOS we cannot prefill those. Documented in docs/clients.md.
@@ -380,7 +380,7 @@ fun ProfileScreen(
                     onSelect = { onHealthExportChange(it == 1) },
                 )
             }
-            ActionRow("Remove Open Oura records from Health Connect", onRemoveHealthSamples)
+            ActionRow("Remove Open Oura records from Health Connect", onClick = onRemoveHealthSamples)
             healthNote?.let {
                 Text(it, fontFamily = Obs.mono, fontSize = 11.sp, color = colors.ink2)
             }
@@ -415,17 +415,17 @@ private fun NumberField(label: String, value: String, unit: String, onChange: (S
 }
 
 @Composable
-internal fun ActionRow(label: String, onClick: () -> Unit) {
+internal fun ActionRow(label: String, enabled: Boolean = true, onClick: () -> Unit) {
     val colors = Obs.colors
     Text(
         label,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .background(colors.rule.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
             .padding(horizontal = 12.dp, vertical = 10.dp),
         fontFamily = Obs.mono,
         fontSize = 13.sp,
-        color = colors.ink,
+        color = if (enabled) colors.ink else colors.muted,
     )
 }

@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import md.thomas.openoura.core.Core
+import md.thomas.openoura.data.DayAnalysisKind
 import md.thomas.openoura.data.Summary
 import md.thomas.openoura.diag.Diagnostics.log
 import md.thomas.openoura.health.HealthExport
@@ -30,6 +31,10 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
     var summary by mutableStateOf<Summary?>(null)
         private set
     var loading by mutableStateOf(false)
+        private set
+
+    /** A per-day refresh is running (the day report's rerun button). */
+    var refreshingDay by mutableStateOf(false)
         private set
 
     /** e.g. "staging sleep · night 3/12" — the ModelProgress pill on iOS. */
@@ -91,5 +96,32 @@ class SummaryViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    /**
+     * Rerun one day's report without touching the other models or days. Port of
+     * `refreshDayAnalysis` in apps/ios/OuraApp/OuraApp.swift: publishes the updated
+     * summary on success (guarded against a concurrent reload), returns a user-facing
+     * error, or null on success.
+     */
+    suspend fun refreshDay(day: String, kind: DayAnalysisKind): String? {
+        val app = getApplication<Application>()
+        if (loading || refreshingDay) return "Wait for sync and analysis to finish, then try again."
+        val mine = generation
+        val previous = summary ?: return "Wait for sync and analysis to finish, then try again."
+        refreshingDay = true
+        val (updated, error) = withContext(Dispatchers.Default) {
+            ModelPipeline.refreshDay(app, previous, day, kind) { step ->
+                viewModelScope.launch { modelProgress = step }
+            }
+        }
+        refreshingDay = false
+        modelProgress = null
+        if (error == null && mine == generation) {
+            summary = updated
+            SummaryCache.save(app, updated)
+            HealthExport.push(app, updated)
+        }
+        return error
     }
 }

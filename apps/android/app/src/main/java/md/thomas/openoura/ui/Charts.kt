@@ -1,9 +1,22 @@
 package md.thomas.openoura.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -14,11 +27,21 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import md.thomas.openoura.core.Core
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 // Hand-drawn charts, ported from apps/ios/OuraApp/Components.swift. Compose `Canvas`
@@ -278,3 +301,163 @@ internal fun DrawScope.drawHGrid(color: Color, fractions: List<Float> = listOf(0
         drawLine(color.copy(alpha = 0.4f), Offset(0f, y), Offset(size.width, y), strokeWidth = 0.5f)
     }
 }
+
+/** One run of the same direction; charging stretches are drawn apart from draining runs. */
+internal data class BatterySeg(val up: Boolean, val from: Int, val to: Int)
+
+/**
+ * Pure `batteryChart` maths, kept off the canvas so the JVM tests can pin it: the data
+ * floor (a full battery is the top of the scale, the bottom follows the readings) and
+ * the runs of the same direction, so charging can be drawn differently.
+ */
+internal fun batteryAxis(pts: List<Pair<Double, Double>>): Triple<Double, Double, List<BatterySeg>> {
+    val lo = max(0.0, floor(pts.minOf { it.second } / 10) * 10 - 5.0)
+    val segs = ArrayList<BatterySeg>()
+    for (i in 1 until pts.size) {
+        val up = pts[i].second > pts[i - 1].second
+        if (segs.isEmpty() || segs.last().up != up) segs += BatterySeg(up, i - 1, i)
+        else segs[segs.size - 1] = BatterySeg(up, segs.last().from, i)
+    }
+    return Triple(pts.first().first, lo, segs)
+}
+
+/**
+ * The ring's own battery readings (device.battery_history, [unix_s, percent]) over the
+ * days they span. Port of the web dashboard's `batteryChart` (app.js). Stretches where
+ * the level rises are it charging, which the readings show on their own — the event's
+ * two flag bytes aren't decoded, so nothing here depends on guessing what they mean.
+ *
+ * A full battery is the top of the scale, but the bottom follows the data: a ring that
+ * has only been 80–100% draws as a flat line against a 0–100 axis instead of inventing
+ * a swing. Both ends are labelled so a zoomed axis can't read as a bigger swing than it is.
+ */
+@Composable
+fun BatteryHistoryChart(history: List<List<Double>>, modifier: Modifier = Modifier) {
+    val colors = Obs.colors
+    val pts = history.mapNotNull { p ->
+        if (p.size < 2 || !p[0].isFinite() || !p[1].isFinite()) null else p[0] to p[1]
+    }
+    if (pts.size < 2) return
+    val (t0, lo, segs) = batteryAxis(pts)
+    val t1 = pts.last().first
+    val span = max(t1 - t0, 1.0)
+    val hi = 100.0
+
+    var cursorIndex by remember(pts) { mutableStateOf<Int?>(null) }
+    fun nearest(x: Float, w: Float): Int? =
+        pts.indices.minByOrNull { abs(pts[it].first - (t0 + x / max(w, 1f) * span)) }
+
+    Column(modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "Battery",
+                fontFamily = Obs.mono,
+                fontSize = 10.sp,
+                letterSpacing = 1.2.sp,
+                color = colors.ink2,
+            )
+            val c = cursorIndex
+            Text(
+                if (c != null) "${battStamp(pts[c].first)} · ${pts[c].second.roundToInt()}%"
+                else "",
+                fontFamily = Obs.mono,
+                fontSize = 11.sp,
+                color = colors.muted,
+            )
+        }
+
+        Box(Modifier.fillMaxWidth().height(44.dp)) {
+            Canvas(
+                Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .padding(end = 40.dp)
+                    .pointerInput(pts) {
+                        detectTapGestures(onTap = { cursorIndex = nearest(it.x, size.width.toFloat()) })
+                    }
+                    .pointerInput(pts) {
+                        detectDragGestures(
+                            onDragStart = { cursorIndex = nearest(it.x, size.width.toFloat()) },
+                            onDrag = { change, _ -> cursorIndex = nearest(change.position.x, size.width.toFloat()) },
+                            onDragEnd = { cursorIndex = null },
+                            onDragCancel = { cursorIndex = null },
+                        )
+                    },
+            ) {
+                val w = size.width
+                val h = size.height
+                fun x(t: Double) = ((t - t0) / span * w).toFloat()
+                fun y(p: Double) = h - ((p - lo) / (hi - lo) * h).toFloat()
+
+                var v = ceil((lo + 1) / 10) * 10
+                while (v < hi) {
+                    drawLine(colors.rule.copy(alpha = 0.55f), Offset(0f, y(v)), Offset(w, y(v)), strokeWidth = 0.5f)
+                    v += 10
+                }
+                for (seg in segs) {
+                    val path = Path().apply {
+                        for (i in seg.from..seg.to) {
+                            val p = pts[i]
+                            if (i == seg.from) moveTo(x(p.first), y(p.second))
+                            else lineTo(x(p.first), y(p.second))
+                        }
+                    }
+                    if (seg.up) {
+                        drawPath(path, colors.good, style = Stroke(2f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                    } else {
+                        drawPath(
+                            path,
+                            colors.chart.copy(alpha = 0.85f),
+                            style = Stroke(1.2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+                        )
+                    }
+                }
+                cursorIndex?.let { i ->
+                    drawLine(colors.good, Offset(x(pts[i].first), 0f), Offset(x(pts[i].first), h), strokeWidth = 1f)
+                }
+            }
+
+            Text(
+                "${hi.toInt()}%",
+                Modifier.align(Alignment.TopEnd),
+                fontFamily = Obs.mono, fontSize = 10.sp, color = colors.muted,
+            )
+            Text(
+                "${lo.roundToInt()}%",
+                Modifier.align(Alignment.BottomEnd),
+                fontFamily = Obs.mono, fontSize = 10.sp, color = colors.muted,
+            )
+        }
+
+        val days = max(1, ((t1 - t0) / 86_400.0).roundToInt())
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(
+                "${battDay(t0)} → ${battStamp(t1)}",
+                fontFamily = Obs.mono, fontSize = 10.sp, color = colors.muted,
+            )
+            Text(
+                "$days day${if (days == 1) "" else "s"}",
+                fontFamily = Obs.mono, fontSize = 10.sp, color = colors.muted,
+            )
+        }
+    }
+}
+
+// Labels follow the summary's fixed tz offset (the web's CURRENT_TZ), not the system
+// zone: a reading mid-DST gets labelled in the same frame the report otherwise uses.
+private fun battZone(): ZoneOffset = ZoneOffset.ofTotalSeconds(Core.tzOffsetHours().toInt() * 3600)
+
+private fun battFormat(pattern: String, unix: Double): String =
+    DateTimeFormatter.ofPattern(pattern, Locale.getDefault()).format(
+        Instant.ofEpochSecond(unix.toLong()).atOffset(battZone()),
+    )
+
+/** "Thu · Mar 2" — the first reading's date, web `dayTitle(ymdOf(t0))`. */
+internal fun battDay(unix: Double): String = battFormat("EEE · MMM d", unix)
+
+/** "03/06 20:31" — web `hhmmOf`. */
+internal fun battStamp(unix: Double): String = battFormat("MM/dd HH:mm", unix)

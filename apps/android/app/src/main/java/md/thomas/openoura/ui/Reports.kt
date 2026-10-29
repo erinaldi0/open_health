@@ -25,6 +25,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import kotlinx.coroutines.withContext
 import androidx.core.content.FileProvider
 import md.thomas.openoura.ble.RingSync
 import md.thomas.openoura.data.BedtimeOverrideStore
+import md.thomas.openoura.data.DayAnalysisKind
 import md.thomas.openoura.data.DayExport
 import md.thomas.openoura.store.DB
 import md.thomas.openoura.data.NightRow
@@ -57,6 +59,7 @@ import md.thomas.openoura.data.Summary
 import md.thomas.openoura.data.WakingActivityTimeline
 import md.thomas.openoura.data.clockLabel
 import md.thomas.openoura.data.wakingActivityTimeline
+import md.thomas.openoura.models.ModelPipeline
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -99,9 +102,31 @@ fun DayReportScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
     onSummaryChanged: () -> Unit = {},
+    busy: Boolean = false,
+    enableRefresh: Boolean = ModelPipeline.AVAILABLE,
+    onRefreshDay: suspend (String, DayAnalysisKind) -> String? = { _, _ -> null },
 ) {
     val colors = Obs.colors
     var sleep by remember(day) { mutableStateOf(startOnSleep) }
+    var refreshing by remember(day) { mutableStateOf(false) }
+    var refreshMessage by remember(day) { mutableStateOf<String?>(null) }
+    var autoRefreshed by remember(day) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // iOS mirrors this auto-refresh in DayReportView.task: a sleep night that has signal
+    // data but no hypnogram yet is staged on demand, once per day.
+    LaunchedEffect(day, sleep, refreshing, busy, autoRefreshed) {
+        if (enableRefresh && sleep && !autoRefreshed && !refreshing && !busy) {
+            val night = s.nightForDay(day)
+            if (night != null && !night.hasHypnogram && night.hasSignals) {
+                autoRefreshed = true
+                refreshing = true
+                val error = onRefreshDay(day, DayAnalysisKind.SLEEP)
+                if (error != null) refreshMessage = error
+                refreshing = false
+            }
+        }
+    }
 
     Column(modifier.fillMaxSize().background(colors.paper)) {
         Row(
@@ -118,6 +143,28 @@ fun DayReportScreen(
             )
             Text(day, fontFamily = Obs.mono, fontSize = 13.sp, color = colors.muted)
             Spacer(Modifier.weight(1f))
+            if (enableRefresh) {
+                // Rerun the selected analysis for this day — the port of iOS's
+                // refreshButton; absent in the model-free lite build.
+                Text(
+                    if (refreshing) "…" else "↻",
+                    modifier = Modifier
+                        .clickable(enabled = !refreshing && !busy) {
+                            refreshMessage = null
+                            refreshing = true
+                            scope.launch {
+                                val kind = if (sleep) DayAnalysisKind.SLEEP else DayAnalysisKind.ACTIVITY
+                                val error = onRefreshDay(day, kind)
+                                refreshMessage = error ?: "Analysis updated."
+                                refreshing = false
+                            }
+                        }
+                        .padding(6.dp),
+                    fontFamily = Obs.mono,
+                    fontSize = 14.sp,
+                    color = if (refreshing || busy) colors.ink2.copy(alpha = 0.4f) else colors.ink2,
+                )
+            }
             DayExportMenu(s, day, sleep)
             Segmented(
                 options = listOf("Sleep", "Activity"),
@@ -129,6 +176,11 @@ fun DayReportScreen(
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 40.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
+            // Only shown while a refresh runs or right after one, so the report keeps its space.
+            when {
+                refreshMessage != null -> item { EmptyNote(refreshMessage.orEmpty()) }
+                refreshing -> item { EmptyNote("Keep the app open while analysis runs.") }
+            }
             if (sleep) {
                 val night = s.nightForDay(day)
                 if (night == null) {

@@ -102,6 +102,27 @@ object RingKeyStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 }
 
+/**
+ * The serial of the ring this app knows about, remembered after a successful sync or a
+ * pair. Port of iOS's `RingSync.knownSerial` (UserDefaults key `ring.serial`), and what
+ * gates factory-reset: the wipe only proceeds when the ring that answers reports this
+ * serial, so a tap can never erase a different ring on the same charger.
+ */
+object KnownRing {
+    /** iOS `rememberSerial` ignores an empty or placeholder serial. */
+    fun save(context: Context, serial: String) {
+        val s = validRingSerial(serial) ?: return
+        Prefs.of(context).edit().putString(Prefs.RING_SERIAL, s).apply()
+    }
+
+    fun load(context: Context): String? =
+        validRingSerial(Prefs.of(context).getString(Prefs.RING_SERIAL, null))
+}
+
+/** A ring serial worth remembering: trimmed, non-empty, and not the `unknown` placeholder. */
+fun validRingSerial(raw: String?): String? =
+    raw?.trim()?.takeIf { it.isNotEmpty() && !it.equals("unknown", ignoreCase = true) }
+
 /** The 32-hex ring key the FFI expects; `parse_key` in Rust rejects anything else. */
 fun isValidRingKey(hex: String): Boolean {
     val h = hex.trim()
@@ -173,6 +194,8 @@ object Prefs {
 
     const val LAST_SUCCESSFUL_SYNC_AT = "ring.last-successful-sync-at"
     const val SYNC_INCOMPLETE = "ring.sync-incomplete"
+    // The ring's serial, remembered from a sync or pair. Gates factory-reset (see KnownRing).
+    const val RING_SERIAL = "ring.serial"
     // The 60 s failed-attempt debounce lives in prefs, not memory, because each background
     // worker run is a fresh SyncEngine instance with no in-process history to consult.
     const val LAST_AUTOMATIC_ATTEMPT_AT = "ring.last-automatic-attempt-at"

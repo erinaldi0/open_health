@@ -42,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import md.thomas.openoura.ble.BlePermissions
@@ -66,6 +67,7 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
     var dataNote by remember { mutableStateOf<String?>(null) }
     var dataBusy by remember { mutableStateOf(false) }
     var confirmRestore by remember { mutableStateOf(false) }
+    var confirmWipeRing by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -106,6 +108,23 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
                 restorePicker.launch(arrayOf("*/*"))
             },
             onDismiss = { confirmRestore = false },
+        )
+    }
+
+    val knownSerial = ring.knownSerial
+    if (confirmWipeRing) {
+        FactoryResetConfirmDialog(
+            serial = knownSerial ?: "the ring",
+            onConfirm = {
+                confirmWipeRing = false
+                val serial = knownSerial
+                if (serial != null) {
+                    scope.launch {
+                        if (ring.factoryReset(keyHex = key, confirmSerial = serial)) key = ""
+                    }
+                }
+            },
+            onDismiss = { confirmWipeRing = false },
         )
     }
 
@@ -151,11 +170,43 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
                 color = if (key.isEmpty() || isValidRingKey(key)) colors.muted else colors.bad,
             )
 
+            // Adopt a factory-reset ring without a computer: mint the key on this phone.
+            val canPair = !ring.working
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row {
+                    Text("No key? ", fontFamily = Obs.prose, fontSize = 13.sp, color = colors.ink2)
+                    Text(
+                        "Pair a factory-reset ring",
+                        modifier = Modifier.clickable(enabled = canPair) {
+                            scope.launch {
+                                ring.pair()?.let { key = it.trim() }
+                            }
+                        },
+                        fontFamily = Obs.prose,
+                        fontSize = 13.sp,
+                        color = if (canPair) colors.ink else colors.muted,
+                        textDecoration = TextDecoration.Underline,
+                    )
+                }
+                Text(
+                    "Write the new key down: it cannot be read back from the ring.",
+                    fontFamily = Obs.prose,
+                    fontSize = 12.sp,
+                    color = colors.muted,
+                )
+            }
+
             if (ring.busy) {
                 ActionRow("Pause sync") { ring.pause() }
             }
-            ActionRow(if (ring.busy) "Syncing…" else "Connect & Sync") {
-                if (ring.busy) return@ActionRow
+            ActionRow(
+                when {
+                    ring.pairing -> "Pairing…"
+                    ring.busy -> "Syncing…"
+                    else -> "Connect & Sync"
+                }
+            ) {
+                if (ring.working) return@ActionRow
                 // Ask for any missing Bluetooth grants and — on API 33+ — notification
                 // permission so the ongoing sync notification is visible. The sync starts
                 // from the launcher callback once Bluetooth is granted.
@@ -182,7 +233,7 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
             }
 
             Rule("your data")
-            ActionRow("Browse raw data", onOpenRawData)
+            ActionRow("Browse raw data", onClick = onOpenRawData)
             ActionRow("Check database") {
                 if (dataBusy) return@ActionRow
                 dataBusy = true
@@ -224,6 +275,19 @@ fun SyncScreen(ring: RingSync, onBack: () -> Unit, onSynced: () -> Unit, onOpenR
             Text(
                 "Deletes the synced database only. Your ring keeps its history, and the next " +
                     "sync drains it again from the start.",
+                fontFamily = Obs.prose,
+                fontSize = 12.sp,
+                color = colors.muted,
+            )
+            ActionRow(
+                if (ring.knownSerial == null) "Factory-reset the ring (available after the first sync)"
+                else "Factory-reset the ring",
+                enabled = ring.canFactoryReset(key),
+            ) { confirmWipeRing = true }
+            Text(
+                "Erases the ring's pairing key, its Bluetooth bonds, any events it hasn't sent " +
+                    "yet, and your stored body profile. Sync first — this cannot be undone, but " +
+                    "the ring stays yours: pair it again right here afterwards.",
                 fontFamily = Obs.prose,
                 fontSize = 12.sp,
                 color = colors.muted,
@@ -294,6 +358,24 @@ private fun RestoreConfirmDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
             )
         },
         confirmButton = { TextButton(onClick = onConfirm) { Text("Choose file") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun FactoryResetConfirmDialog(serial: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Factory-reset $serial?") },
+        text = {
+            Text(
+                "Erases the ring's pairing key, its Bluetooth bonds, any events it hasn't " +
+                    "sent yet, and your stored body profile. Sync first if you want those " +
+                    "events. This cannot be undone — but the ring stays yours: pair it again " +
+                    "right here afterwards."
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Erase the ring") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

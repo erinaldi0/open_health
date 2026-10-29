@@ -1,6 +1,7 @@
 package md.thomas.openoura.models
 
 import android.content.Context
+import md.thomas.openoura.data.DayAnalysisKind
 import md.thomas.openoura.data.Summary
 
 /**
@@ -23,4 +24,13 @@ object ModelPipeline {
         previous: Summary?,
         progress: (String) -> Unit,
     ): Summary? = null
+
+    fun refreshDay(
+        context: Context,
+        previous: Summary,
+        day: String,
+        kind: DayAnalysisKind,
+        progress: (String) -> Unit = {},
+    ): Pair<Summary, String?> =
+        previous to "This build has no analysis models."
 }

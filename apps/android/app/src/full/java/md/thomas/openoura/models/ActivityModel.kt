@@ -12,6 +12,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.ceil
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -21,12 +22,25 @@ import kotlin.math.roundToLong
  * each LOCAL DAY separately and feeds the real decoded step-motion channel; both details
  * materially affect the predicted sport, so both are reproduced here.
  *
- * Port of apps/ios/OuraApp/ActivityModel.swift.
+ * [onlyDay] restricts a run to one `YYYY-MM-DD` key (the "Refresh analysis" action) and
+ * [force] bypasses the per-day fingerprint cache. Port of apps/ios/OuraApp/ActivityModel.swift.
  */
 object ActivityModel {
 
     private const val AAD_MODEL = "automatic_activity_detection_3_1_12"
     private const val STEP_MODEL = "steps_motion_decoder_2_0_0"
+
+    /**
+     * Bumped whenever the per-day preprocessing (dedup, placeholders, reject rule) changes,
+     * so cached results — cached failures above all — are recomputed once instead of being
+     * trusted for inputs the new pipeline would build differently.
+     */
+    private const val PIPELINE_VERSION = 2
+
+    /** Mirror of the model's `get_last_valid_time` reject rule (see `isDegenerate`). */
+    private const val NON_WEAR_MET_THRESHOLD = 0.2f
+    private const val MIN_VALID_METS = 10
+    private const val ACCEPTABLE_LAST_HR_MISSING_MINUTES = 5f
 
     private val BEHAVIOR = mapOf(
         -1 to "nothing", 0 to "—", 1 to "badminton", 2 to "boxing", 3 to "cross-country skiing",
@@ -44,7 +58,7 @@ object ActivityModel {
 
     private class TimedRow(val unixMinute: Double, val values: FloatArray)
 
-    private class Matrix(val flat: FloatArray, val count: Int)
+    internal class Matrix(val flat: FloatArray, val count: Int)
 
     /**
      * Everything the AAD model receives for one local day — also the exact material the
@@ -69,11 +83,15 @@ object ActivityModel {
         profile: Profile?,
         events: List<EventStore.Ev>,
         clock: EventStore.RingClock,
+        onlyDay: String? = null,
+        force: Boolean = false,
         progress: (String) -> Unit = {},
     ): Outcome {
         val aadPath = ModelAssets.path(context, AAD_MODEL)
             ?: return Outcome(emptyList(), "activity model file missing from the app assets")
-        if (events.isEmpty()) return Outcome(emptyList(), null)
+        if (events.isEmpty()) {
+            return Outcome(emptyList(), if (onlyDay == null) null else "No activity data is saved for this day.")
+        }
 
         val nan = Float.NaN
         fun num(e: EventStore.Ev, key: String): Float = e.num(key)?.toFloat() ?: 0f
@@ -117,7 +135,11 @@ object ActivityModel {
                 }
             }
         }
-        if (met.isEmpty()) return Outcome(emptyList(), null)
+        if (met.isEmpty()) {
+            // An archive without MET rows is a complete, stable no-result — not a cache
+            // miss. A single-day refresh reports it as having nothing to rerun.
+            return Outcome(emptyList(), if (onlyDay == null) null else "No activity data is saved for this day.")
+        }
 
         val stepPackets = collectStepPackets(events, clock)
         val zone = ZoneId.systemDefault()
@@ -143,25 +165,41 @@ object ActivityModel {
             val lo = dayStart / 60.0
             val hi = day.plusDays(1).atStartOfDay(zone).toEpochSecond() / 60.0
 
-            fun matrix(rows: List<TimedRow>, columns: Int, required: Boolean = true): Matrix {
-                val selected = rows.filter { it.unixMinute >= lo && it.unixMinute < hi }
-                    .sortedBy { it.unixMinute }
-                if (selected.isEmpty() && required) {
-                    val flat = FloatArray(columns) { if (it == 0) 0f else nan }
-                    return Matrix(flat, 1)
-                }
-                val flat = FloatArray(selected.size * columns)
-                selected.forEachIndexed { i, row ->
+            fun rowsOfDay(rows: List<TimedRow>): List<TimedRow> =
+                rows.filter { it.unixMinute >= lo && it.unixMinute < hi }.sortedBy { it.unixMinute }
+
+            // The ring may resend a MET minute; Android's Realm series keeps one value per
+            // timestamp (last write wins). Duplicates make the model's resampler throw.
+            val metByMinute = LinkedHashMap<Long, TimedRow>()
+            for (row in rowsOfDay(met)) metByMinute[row.unixMinute.roundToLong()] = row
+            val metRows = metByMinute.values.sortedBy { it.unixMinute }
+            val firstMet = metRows.firstOrNull()?.unixMinute ?: return null
+            val lastMet = metRows.last().unixMinute
+
+            fun flatten(rows: List<TimedRow>, columns: Int): Matrix {
+                val flat = FloatArray(rows.size * columns)
+                rows.forEachIndexed { i, row ->
                     flat[i * columns] = (row.unixMinute - lo).toFloat()
                     row.values.copyInto(flat, i * columns + 1)
                 }
-                return Matrix(flat, selected.size)
+                return Matrix(flat, rows.size)
             }
 
-            val metDay = matrix(met, 2)
-            if (metDay.count == 0) return null
-            val rawStep = stepPackets.filter { it.unixMinute >= lo && it.unixMinute < hi }
-                .sortedBy { it.unixMinute }
+            // A series with no sample inside the MET window is dropped entirely by the
+            // model's valid-time clipping, and it then indexes the empty tensor. A NaN
+            // placeholder at the first MET minute keeps the channel present (and is
+            // ignored as missing data), exactly like tools/run_activity_model.py.
+            fun matrix(rows: List<TimedRow>, columns: Int): Matrix {
+                val selected = rowsOfDay(rows).toMutableList()
+                if (selected.none { it.unixMinute >= firstMet && it.unixMinute <= lastMet }) {
+                    selected.add(TimedRow(firstMet, FloatArray(columns - 1) { nan }))
+                    selected.sortBy { it.unixMinute }
+                }
+                return flatten(selected, columns)
+            }
+
+            val metDay = flatten(metRows, 2)
+            val rawStep = rowsOfDay(stepPackets)
             val ctx = floatArrayOf(
                 day.year.toFloat(), day.monthValue.toFloat(), day.dayOfMonth.toFloat(),
                 // Monday = 0, matching the Swift `(weekday + 5) % 7`
@@ -187,41 +225,132 @@ object ActivityModel {
         val sessions = ArrayList<WorkoutSession>()
         val dirty = ArrayList<Triple<String, DayInputs, String>>()
         val currentKeys = HashSet<String>()
+        val cachedFailures = ArrayList<String>()
 
         for (day in dayStarts) {
-            val inputs = dayInputs(day) ?: continue
             val key = day.format(dayKeyFmt)
+            if (onlyDay != null && key != onlyDay) continue
+            val inputs = dayInputs(day) ?: continue
             val fp = fingerprint(inputs)
             currentKeys.add(key)
             val entry = cache[key]
-            if (entry != null && entry.fp == fp) sessions.addAll(entry.sessions)
-            else dirty.add(Triple(key, inputs, fp))
+            // `force` is the "Refresh analysis" action: rerun even when cached inputs match.
+            if (!force && entry != null && entry.fp == fp) {
+                sessions.addAll(entry.sessions)
+                if (entry.failed) cachedFailures.add(key)
+            } else {
+                dirty.add(Triple(key, inputs, fp))
+            }
         }
 
         log("models", "activity: ${dirty.size}/${currentKeys.size} days to recompute")
+        // A day the model rejects is cached as failed (under its fingerprint) and skipped,
+        // so one degenerate day can never block the days behind it or be retried on every
+        // launch; a forced refresh reruns it.
+        val failedDays = ArrayList<String>()
+        var recomputed = 0
         dirty.forEachIndexed { index, (key, inputs, fp) ->
-            progress("detecting activity · day ${index + 1}/${dirty.size}")
-            val daySessions = runDay(context, inputs, user, aadPath, zone)
-            sessions.addAll(daySessions)
-            cache[key] = ActivityDayEntry(fp, daySessions)
-            // Save after every completed day: a mid-run kill resumes here instead of
-            // restarting the whole history.
-            ModelCacheStore.save(
-                context, ModelCacheStore.ACTIVITY_FILE, globalKey, cache,
-                ActivityDayEntry.serializer(),
+            progress(
+                if (onlyDay != null) "refreshing activity"
+                else "detecting activity · day ${index + 1}/${dirty.size}"
             )
+            var daySessions: List<WorkoutSession> = emptyList()
+            var failed = false
+            if (isDegenerate(inputs.met, inputs.motion, inputs.temp, inputs.hr)) {
+                log(
+                    "models",
+                    "activity day=$key met=${inputs.met.count} motion=${inputs.motion.count} " +
+                        "hr=${inputs.hr.count}: no valid wear window for the model, no sessions",
+                )
+            } else {
+                val result = runDay(context, inputs, user, aadPath, zone)
+                if (result == null) {
+                    failed = true
+                    failedDays.add(key)
+                    log(
+                        "models",
+                        "activity day=$key met=${inputs.met.count} motion=${inputs.motion.count} " +
+                            "temperature=${inputs.temp.count} hr=${inputs.hr.count} " +
+                            "stepPackets=${inputs.rawStep.size} failed",
+                    )
+                } else {
+                    daySessions = result
+                }
+            }
+            sessions.addAll(daySessions)
+            cache[key] = ActivityDayEntry(fp, daySessions, failed)
+            recomputed++
+            // Save every few days and at the end: a mid-run kill resumes here instead of
+            // restarting the whole history.
+            if (recomputed % 5 == 0 || recomputed == dirty.size) {
+                ModelCacheStore.save(
+                    context, ModelCacheStore.ACTIVITY_FILE, globalKey, cache,
+                    ActivityDayEntry.serializer(),
+                )
+            }
         }
 
-        // Drop days the current data no longer produces (e.g. re-dated by a clock
-        // re-anchor) so the file tracks the DB instead of growing stale keys.
-        val pruned = cache.filterKeys { it in currentKeys }
-        if (pruned.size != cache.size) {
-            ModelCacheStore.save(
-                context, ModelCacheStore.ACTIVITY_FILE, globalKey, pruned,
-                ActivityDayEntry.serializer(),
-            )
+        // A single-day refresh over a day with no inputs has nothing to report.
+        if (onlyDay != null && currentKeys.isEmpty()) {
+            return Outcome(emptyList(), "No activity data is saved for this day.")
         }
-        return Outcome(sessions.sortedBy { it.start }, null)
+        // Drop days the current data no longer produces (e.g. re-dated by a clock
+        // re-anchor) so the file tracks the DB instead of growing stale keys. A
+        // single-day refresh keeps the other days' entries intact.
+        if (onlyDay == null) {
+            val pruned = cache.filterKeys { it in currentKeys }
+            if (pruned.size != cache.size) {
+                ModelCacheStore.save(
+                    context, ModelCacheStore.ACTIVITY_FILE, globalKey, pruned,
+                    ActivityDayEntry.serializer(),
+                )
+            }
+        }
+        val allFailed = (failedDays + cachedFailures).sortedDescending()
+        log("models", "activity recomputed=$recomputed total=${currentKeys.size} rejected=${allFailed.size}")
+        return Outcome(sessions.sortedBy { it.start }, failureMessage(allFailed))
+    }
+
+    /**
+     * The user-facing error for days the model rejected; the same text for one day is what
+     * the refresh path removes from `modelErrors` when a rerun succeeds.
+     */
+    private fun failureMessage(failedDays: List<String>): String? {
+        val first = failedDays.firstOrNull() ?: return null
+        val more = failedDays.size - 1
+        return "Activity analysis failed for $first${if (more > 0) " (+$more more)" else ""}. " +
+            "See diagnostics for details."
+    }
+
+    /**
+     * Mirror of the model's `get_last_valid_time`: with fewer than [MIN_VALID_METS] worn MET
+     * minutes before the last motion sample the valid window collapses to minute 0, after
+     * which the graph indexes an empty MET tensor and throws. Such a day has no evaluable
+     * data, so it yields no sessions instead of an error. Kept identical to
+     * `model_would_reject` in tools/run_activity_model.py.
+     */
+    internal fun isDegenerate(met: Matrix, motion: Matrix, temp: Matrix, hr: Matrix): Boolean {
+        fun lastTime(series: Matrix, columns: Int): Float =
+            if (series.count > 0) series.flat[(series.count - 1) * columns] else 0f
+
+        val lastMotion = ceil(lastTime(motion, 9))
+        var lastWornMet: Float? = null
+        var worn = 0
+        for (row in 0 until met.count) {
+            val t = met.flat[row * 2]
+            val value = met.flat[row * 2 + 1]
+            if (value > NON_WEAR_MET_THRESHOLD && t <= lastMotion) {
+                worn++
+                lastWornMet = t
+            }
+        }
+        if (worn < MIN_VALID_METS || lastWornMet == null) return met.flat[0] > 0f
+        val lastHr = ceil(lastTime(hr, 2)) + ACCEPTABLE_LAST_HR_MISSING_MINUTES
+        val lastTemp = ceil(lastTime(temp, 2))
+        // The step boundary row sits on the last MET minute.
+        val lastStep = lastTime(met, 2)
+        val lastValid = minOf(lastWornMet, lastMotion, lastHr, lastStep, lastTemp)
+        return met.flat[0] > lastValid
     }
 
     /**
@@ -230,6 +359,7 @@ object ActivityModel {
      */
     private fun fingerprint(inputs: DayInputs): String {
         val h = FNV64()
+        h.combine(PIPELINE_VERSION)
         h.combine(inputs.dayStartEpochSec.toDouble())
         h.combine(inputs.context)
         h.combine(inputs.met.flat); h.combine(inputs.met.count)
@@ -241,16 +371,16 @@ object ActivityModel {
         return h.hex
     }
 
-    /** One AAD inference over one local day's inputs. */
+    /** One AAD inference over one local day's inputs. Null when the model rejects the day. */
     private fun runDay(
         context: Context,
         inputs: DayInputs,
         user: FloatArray,
         aadPath: String,
         zone: ZoneId,
-    ): List<WorkoutSession> {
+    ): List<WorkoutSession>? {
         val nan = Float.NaN
-        val decoded = decodeStepPackets(context, inputs.rawStep)
+        val decoded = decodeStepPackets(context, inputs.rawStep) ?: return null
         val lo = inputs.dayStartEpochSec / 60.0
         val firstMet = inputs.met.flat[0]
         val lastMet = inputs.met.flat[(inputs.met.count - 1) * 2]
@@ -275,7 +405,7 @@ object ActivityModel {
             inputs.temp.flat, inputs.temp.count,
             inputs.hr.flat, inputs.hr.count,
             0.5f, 10.0f,
-        ) ?: return emptyList()
+        ) ?: return null
         if (output.isEmpty()) return emptyList()
 
         val stamp = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(zone)
@@ -320,13 +450,13 @@ object ActivityModel {
     }
 
     /**
-     * Decode one day's 27-column gait packets. Hiking days can be thousands of pairs;
-     * feeding the whole history as one tensor was what jetsam-killed the iOS app, so the
-     * work is chunked with an overlap and de-duplicated by timestamp.
+     * Decode one day's 27-column gait packets. Hiking days can be thousands of pairs; feeding
+     * the whole history as one tensor was what jetsam-killed the iOS app, so the work is
+     * chunked with an overlap and de-duplicated by timestamp. Null = the decoder failed.
      */
-    private fun decodeStepPackets(context: Context, packets: List<TimedRow>): List<TimedRow> {
+    private fun decodeStepPackets(context: Context, packets: List<TimedRow>): List<TimedRow>? {
         if (packets.isEmpty()) return emptyList()
-        val modelPath = ModelAssets.path(context, STEP_MODEL) ?: return emptyList()
+        val modelPath = ModelAssets.path(context, STEP_MODEL) ?: return null
         val chunk = 4096
         val overlap = 24
         if (packets.size <= chunk) return runStepDecoder(packets, modelPath)
@@ -336,7 +466,8 @@ object ActivityModel {
         var i = 0
         while (i < packets.size) {
             val end = min(packets.size, i + chunk)
-            for (row in runStepDecoder(packets.subList(i, end), modelPath)) {
+            val decoded = runStepDecoder(packets.subList(i, end), modelPath) ?: return null
+            for (row in decoded) {
                 val key = (row.unixMinute * 60_000).roundToLong()
                 if (seen.add(key)) out.add(row)
             }
@@ -346,7 +477,7 @@ object ActivityModel {
         return out
     }
 
-    private fun runStepDecoder(packets: List<TimedRow>, modelPath: String): List<TimedRow> {
+    private fun runStepDecoder(packets: List<TimedRow>, modelPath: String): List<TimedRow>? {
         val timestamps = LongArray(packets.size) { (packets[it].unixMinute * 60_000).roundToLong() }
         val raw = FloatArray(packets.size * 27)
         packets.forEachIndexed { i, p -> p.values.copyInto(raw, i * 27) }
@@ -355,7 +486,7 @@ object ActivityModel {
 
         val features = TorchBridge.stepMotion(
             modelPath, timestamps, raw, packets.size, outputTimestamps
-        ) ?: return emptyList()
+        ) ?: return null
         val rows = features.size / 11
         if (rows == 0) return emptyList()
 

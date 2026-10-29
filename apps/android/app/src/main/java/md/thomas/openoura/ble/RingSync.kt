@@ -20,6 +20,7 @@ import java.util.Locale
 import java.util.UUID
 import md.thomas.openoura.diag.Diagnostics.log
 import md.thomas.openoura.store.DB
+import md.thomas.openoura.store.KnownRing
 import md.thomas.openoura.store.Prefs
 import md.thomas.openoura.store.RingKeyStore
 
@@ -46,10 +47,24 @@ class RingSync(app: android.app.Application) : AndroidViewModel(app) {
     var lastSuccessfulSyncAtMs by mutableStateOf<Long?>(null)
         private set
 
+    /** The serial of the ring last synced/paired here; gates factory-reset. */
+    var knownSerial by mutableStateOf<String?>(null)
+        private set
+
+    /** True while a foreground pair/reset holds the ring — not a WorkManager sync. */
+    var pairing by mutableStateOf(false)
+        private set
+
+    /** Anything holding the ring's single BLE link right now. */
+    val working: Boolean get() = busy || pairing
+
     private val context: Context get() = getApplication()
+    // Foreground pair/reset drive BLE directly (WorkManager can't hand a minted key back).
+    private val engine = SyncEngine(getApplication())
 
     init {
         lastSuccessfulSyncAtMs = Prefs.of(app).getLong(Prefs.LAST_SUCCESSFUL_SYNC_AT, 0L).takeIf { it > 0 }
+        knownSerial = KnownRing.load(app)
         // Reflect every sync — scheduled, app-start, or manual — into Compose state.
         viewModelScope.launch {
             SyncScheduler.observe(context).collect(::onWorkInfos)
@@ -81,6 +96,7 @@ class RingSync(app: android.app.Application) : AndroidViewModel(app) {
             lastSummary = summary
             lastSuccessfulSyncAtMs =
                 Prefs.of(context).getLong(Prefs.LAST_SUCCESSFUL_SYNC_AT, 0L).takeIf { it > 0 }
+            knownSerial = KnownRing.load(context)
         }
     }
 
@@ -88,6 +104,47 @@ class RingSync(app: android.app.Application) : AndroidViewModel(app) {
         lastSuccessfulSyncAtMs?.let { nowMs - it < SyncEngine.AUTOMATIC_SYNC_COOLDOWN_MS } ?: false
 
     fun hasStoredKey(): Boolean = RingKeyStore.load(context) != null
+
+    /** Whether the factory-reset row should be enabled: a known serial, a valid key, idle. */
+    fun canFactoryReset(key: String): Boolean = !working && SyncEngine.canFactoryReset(knownSerial, key)
+
+    /**
+     * Adopt a factory-reset ring from the phone alone. Returns the minted key (32 hex) so the
+     * UI can show it for backup, or null on failure. The key and serial are persisted before
+     * returning — the ring now holds the key and will not hand it back. Mirrors iOS
+     * `RingSync.pair`.
+     */
+    suspend fun pair(existingKeyHex: String? = null): String? {
+        if (pairing || busy) return null
+        pairing = true
+        try {
+            val report = engine.pair(existingKeyHex) { status = it } ?: return null
+            RingKeyStore.save(context, report.keyHex)
+            KnownRing.save(context, report.serial)
+            knownSerial = KnownRing.load(context)
+            lastSummary = null
+            return report.keyHex
+        } finally {
+            pairing = false
+        }
+    }
+
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state and drop the stored key — it no
+     * longer opens anything. Returns true on success. Mirrors iOS `RingSync.factoryReset`.
+     */
+    suspend fun factoryReset(keyHex: String, confirmSerial: String): Boolean {
+        if (pairing || busy) return false
+        pairing = true
+        try {
+            engine.factoryReset(keyHex, confirmSerial) { status = it } ?: return false
+            RingKeyStore.clear(context)
+            lastSummary = null
+            return true
+        } finally {
+            pairing = false
+        }
+    }
 
     /** Manual "Connect & Sync". The key is read from the Keystore inside the worker. */
     fun sync() = SyncScheduler.syncNow(context, RingSyncWorker.SOURCE_MANUAL)

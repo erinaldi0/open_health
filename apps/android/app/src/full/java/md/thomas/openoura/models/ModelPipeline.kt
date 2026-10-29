@@ -1,8 +1,12 @@
 package md.thomas.openoura.models
 
 import android.content.Context
+import md.thomas.openoura.core.Core
 import md.thomas.openoura.data.Cardio
+import md.thomas.openoura.data.DayAnalysisKind
 import md.thomas.openoura.data.EventStore
+import md.thomas.openoura.data.Sleep
+import md.thomas.openoura.data.StageAutonomicJson
 import md.thomas.openoura.data.Summary
 import md.thomas.openoura.data.stagedSleepDebt
 import md.thomas.openoura.diag.Diagnostics.log
@@ -17,6 +21,11 @@ import kotlin.math.roundToLong
  * serializes `forward()`). Concurrent inference raced the interpreter and peaked RAM on
  * hiking-heavy histories. Each reports a per-model error for genuine failures; those
  * surface in `modelErrors`.
+ *
+ * Memory is bounded instead by the shared read: `EventStore.decodedEvents` keeps at most
+ * the newest 100k events (the model windows live at the end of the sync order), models
+ * cap and cache their per-day tensors, and one-pass preprocessing drops the JSON of
+ * step packets (`0x7E`/`0x7F`) up front.
  */
 object ModelPipeline {
     const val AVAILABLE = true
@@ -47,22 +56,22 @@ object ModelPipeline {
         // One shared read: one failure point, one lock-contention window, and the
         // RingClock epoch recovery is paid once instead of once per model.
         progress("reading ring data…")
-        var events: List<EventStore.Ev> = emptyList()
         var readErr: String? = null
+        var events: List<EventStore.Ev> = emptyList()
         try {
             events = EventStore.decodedEvents(DB.readPath(context))
         } catch (e: Exception) {
             readErr = e.message ?: e.toString()
         }
-        log("models", "read ${events.size} events")
 
         if (readErr == null && events.isNotEmpty()) {
+            log("models", "read ${events.size} events")
             val clock = EventStore.RingClock(events)
-            val rSleep = SleepStaging.run(context, base.nights, events, clock, progress)
+            val rSleep = SleepStaging.run(context, base.nights, events, clock, progress = progress)
             staged = rSleep.staged
             sleepErr = rSleep.error
 
-            val rAct = ActivityModel.run(context, profile, events, clock, progress)
+            val rAct = ActivityModel.run(context, profile, events, clock, progress = progress)
             workouts = rAct.sessions
             actErr = rAct.error
 
@@ -102,40 +111,7 @@ object ModelPipeline {
 
         // Fold SleepNet's hypnogram + stage breakdown into each night, keyed by the exact
         // bedtime start_ds so two sleeps on one calendar day don't collide.
-        s = s.copy(
-            nights = s.nights.map { night ->
-                val stages = night.startDs?.let { staged[it.toString()] }
-                if (stages.isNullOrEmpty()) return@map night
-                val total = stages.size.toDouble()
-                fun pct(code: Int) = (stages.count { it == code } / total * 100).roundToLong().toDouble()
-                val asleep = total - stages.count { it == 4 }
-                val complete = stages.all { it in 1..4 }
-                // Mirrors iOS Core.swift: SleepNet replaces the ring's hypnogram in BOTH the
-                // preview and the full-resolution field, so metrics can't read the old one.
-                night.copy(
-                    stages = stages,
-                    stagesFull = stages,
-                    stagingSource = "sleepnet",
-                    stagingCompleteJson = complete,
-                    stagingCoveragePct = stages.count { it in 1..4 } / total * 100,
-                    deepPct = pct(1),
-                    lightPct = pct(2),
-                    remPct = pct(3),
-                    wakePct = pct(4),
-                    efficiency = if (complete) (asleep / total * 100).roundToLong().toDouble() else null,
-                    sleepScore = null, // the core's score describes a different hypnogram
-                )
-            }
-        )
-
-        // Staging can be partial while model inputs are still arriving. Never replace a
-        // more complete model-free debt window with a transient "0 of 5" result; prefer
-        // staged sleep only when it covers at least as many distinct days.
-        s.stagedSleepDebt()?.let { stagedDebt ->
-            if (stagedDebt.validDays >= (s.sleepDebt?.validDays ?: 0)) {
-                s = s.copy(sleepDebt = stagedDebt)
-            }
-        }
+        s = applySleepStages(staged, s)
 
         s = when {
             cva != null -> s.copy(
@@ -160,5 +136,124 @@ object ModelPipeline {
             modelErrors = listOfNotNull(sleepErr, cvaErr, actErr, illErr).distinct(),
         )
         return s
+    }
+
+    /**
+     * Fold staged SleepNet output into the nights and refresh the debt window once the
+     * staged coverage is at least as large as the model-free one. Port of `Core.applySleepStages`
+     * in apps/ios/OuraApp/Core.swift.
+     */
+    private fun applySleepStages(staged: Map<String, List<Int>>, summary: Summary): Summary {
+        var s = summary
+        s = s.copy(
+            nights = s.nights.map { night ->
+                val sds = night.startDs ?: return@map night
+                var stages = staged[sds.toString()] ?: return@map night
+                if (stages.isEmpty()) return@map night
+                // SleepNet has no staging for deep sleep; when a night carries none, restore
+                // the deep-sleep epochs from the ring's signal morphology, as the iOS app does.
+                if (stages.none { it == 1 }) {
+                    stages = Sleep.refineDeepStages(stages, night)
+                }
+                val total = stages.size.toDouble()
+                fun pct(code: Int) = (stages.count { it == code } / total * 100).roundToLong().toDouble()
+                val asleep = total - stages.count { it == 4 }
+                val complete = stages.all { it in 1..4 }
+                val autonomic = Sleep.autonomic(night, Sleep.smooth(stages, 5))
+                // Mirrors iOS Core.swift: SleepNet replaces the ring's hypnogram in BOTH the
+                // preview and the full-resolution field, so metrics can't read the old one.
+                night.copy(
+                    stages = stages,
+                    stagesFull = stages,
+                    stagingSource = "sleepnet",
+                    stagingCompleteJson = complete,
+                    stagingCoveragePct = stages.count { it in 1..4 } / total * 100,
+                    deepPct = pct(1),
+                    lightPct = pct(2),
+                    remPct = pct(3),
+                    wakePct = pct(4),
+                    efficiency = if (complete) (asleep / total * 100).roundToLong().toDouble() else null,
+                    sleepScore = null,                                  // the core's score describes a different hypnogram
+                    autonomic = StageAutonomicJson(                     // mean HR/HRV per stage over the smoothed hypnogram
+                        hrvDeep = autonomic.hrvDeep,
+                        hrvLight = autonomic.hrvLight,
+                        hrvRem = autonomic.hrvRem,
+                        hrDeep = autonomic.hrDeep,
+                        hrLight = autonomic.hrLight,
+                        hrRem = autonomic.hrRem,
+                    ),
+                )
+            }
+        )
+        // Staging can be partial while model inputs are still arriving. Never replace a
+        // more complete model-free debt window with a transient "0 of 5" result; prefer
+        // staged sleep only when it covers at least as many distinct days.
+        s.stagedSleepDebt()?.let { stagedDebt ->
+            if (stagedDebt.validDays >= (s.sleepDebt?.validDays ?: 0)) {
+                s = s.copy(sleepDebt = stagedDebt)
+            }
+        }
+        return s
+    }
+
+    /**
+     * Rerun ONE report (sleep or activity) for ONE day without touching the other models or
+     * the other days. Port of `Core.refreshAnalysis` in apps/ios/OuraApp/Core.swift. Returns
+     * the updated summary, or the previous one plus a user-facing error when nothing changes.
+     */
+    fun refreshDay(
+        context: Context,
+        previous: Summary,
+        day: String,
+        kind: DayAnalysisKind,
+        progress: (String) -> Unit = {},
+    ): Pair<Summary, String?> {
+        TorchBridge.loadError?.let { return previous to "Couldn't refresh analysis: $it" }
+        val base = Core.base(context)
+        if (base.error != null) return previous to "Couldn't read saved data. Try again."
+        return try {
+            val events = EventStore.decodedEvents(DB.readPath(context))
+            val clock = EventStore.RingClock(events)
+            var s = previous
+            when (kind) {
+                DayAnalysisKind.SLEEP -> {
+                    val night = base.nightForDay(day)
+                    val start = night?.startDs
+                    if (night == null || start == null) {
+                        return previous to "No sleep data is saved for this day."
+                    }
+                    val result = SleepStaging.run(
+                        context, listOf(night), events, clock,
+                        force = true, pruneCache = false, progress = progress,
+                    )
+                    if (result.error != null) {
+                        return previous to "Couldn't refresh sleep analysis: ${result.error}"
+                    }
+                    val stages = result.staged[start.toString()]
+                    if (stages.isNullOrEmpty()) {
+                        return previous to "Not enough saved sleep data to refresh this night."
+                    }
+                    s = s.replacingNight(day, night)
+                    s = applySleepStages(result.staged, s)
+                }
+                DayAnalysisKind.ACTIVITY -> {
+                    if (base.activityProfile[day] == null) {
+                        return previous to "No activity data is saved for this day."
+                    }
+                    val result = ActivityModel.run(
+                        context, base.profile, events, clock,
+                        onlyDay = day, force = true, progress = progress,
+                    )
+                    if (result.error != null) {
+                        return previous to "Couldn't refresh activity analysis: ${result.error}"
+                    }
+                    s = s.replacingWorkouts(day, result.sessions)
+                }
+            }
+            s to null
+        } catch (e: Throwable) {
+            log("models", "refresh day=$day kind=$kind failed: ${e.message ?: e}")
+            previous to "Couldn't refresh ${kind.label.lowercase()} analysis. Your previous results are still available. See diagnostics for details."
+        }
     }
 }

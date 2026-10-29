@@ -67,7 +67,7 @@ metric there once and both clients receive it in the JSON.
 | **Raw data browser** (event types, field charts) | per-type event stream | `RawDataView` (RawData.swift) | `RawDataScreen` (Sync → Browse raw data) | FFI `events_json` | — |
 | **Database export / check / restore** | — (desktop has the file) | Help & diagnostics | Sync → "your data" | FFI `export_database`, `database_integrity` | — |
 | **Ring clock warnings + per-boot report** | clock warnings | Home warnings, Technical reports | Home "ring clock" card, Sync diagnostics | `clock.{warnings,epochs,undated_nights}` | — |
-| **Battery history** (level over the days with readings; charging runs drawn apart) | `renderDevice`→`batteryChart` | — | — (decoded, not drawn) | `device.battery_history` (`[unix, percent]`, 14 days) | — |
+| **Battery history** (level over the days with readings; charging runs drawn apart) | `renderDevice`→`batteryChart` | — | device card → `BatteryHistoryChart` (ui/Charts.kt) | `device.battery_history` (`[unix, percent]`, 14 days) | — |
 
 ## The day is one unit — pair night + activity by *wake date*
 
@@ -97,11 +97,17 @@ longest in-bed night for a morning so a nap doesn't shadow the real sleep.
   is a "Help & diagnostics" card of grouped rows (check data, share report, export raw
   data, technical reports on their own page) with the reset kept apart as a destructive row.
   These phone-layout changes are intentionally iOS-only; the underlying health data is unchanged.
-- **Manual analysis refresh (iOS)**: each day's Sleep and Activity tabs can rerun their
-  respective model from saved ring data. Sleep uses the displayed night's bedtime window
-  (paired by wake date); activity uses the selected calendar day. The action bypasses
-  that result's cache, preserves other days, and publishes successful results to the open
-  report and summary cache. This is separate from syncing new data from the ring.
+- **Manual & automatic day analysis refresh (iOS + Android)**: each day's Sleep and
+  Activity tabs can rerun their respective model from saved ring data. Sleep uses the
+  displayed night's bedtime window (paired by wake date); activity uses the selected
+  calendar day. The action bypasses that result's cache, preserves other days, and
+  publishes successful results to the open report and summary cache. On Android the
+  "↻" button lives in `ui/Reports.kt` `DayReportScreen`, the sleep tab also auto-refreshes
+  once when a night has signals but no hypnogram (the mirror of iOS `DayReportView.task`),
+  and the sharing logic lives in `ModelPipeline.refreshDay` (`models/ModelPipeline.kt`, `full`
+  flavor; lite is a no-op) plus `Summary.replacingNight`/`replacingWorkouts`
+  (`data/Models.kt`, pinned by `DayAnalysisRefreshTest`). This is separate from syncing
+  new data from the ring.
 - **Raw ring data export (iOS)**: Help & diagnostics → “Export raw ring data” writes a
   self-contained copy of the phone's SQLite store (`VACUUM INTO`, no auth key) and hands
   it to the share sheet. On a computer it is a normal `oura --db <file> …` input, so any
@@ -113,12 +119,13 @@ longest in-bed night for a morning so a nap doesn't shadow the real sleep.
   weeks of ds in an hour) makes everything between the two anchors **undated**: the
   summary, the Python runners and the iOS models all leave that data out instead of
   scattering it over months of phantom days.
-- **On-device model caches (iOS)**: every cache file carries a store digest (row count,
-  last id, anchor count, last anchor id). When it matches, activity and illness return
-  their cached results without streaming the store; illness only scans the tags it
-  uses; CVA runs at most once per local day (vascular age moves on a scale of months and
-  every sync adds PPG segments). Activity days the model rejects are cached as failed
-  under their input fingerprint and skipped until a forced refresh or a pipeline bump.
+- **On-device model caches**: iOS additionally stamps every cache file with a store digest
+  (row count, last id, anchor count, last anchor id) so an unchanged store skips streaming
+  it; illness only scans the tags it uses; CVA runs at most once per local day (vascular age
+  moves on a scale of months and every sync adds PPG segments). Both native clients
+  fingerprint each day by its exact model inputs and cache a model-rejected day as failed
+  under that fingerprint, so one degenerate day is skipped instead of aborting the run and
+  is only retried on a forced refresh or a `PIPELINE_VERSION` bump.
 - **Ring clock diagnostics**: the summary JSON carries a `clock` block (per-boot ds range,
   sync window, anchor count/sources, `undated_nights`, `warnings`) and each night carries
   `wake_ymd`, `start_unix`, `end_unix`, `clock_source`. iOS renders the warnings on Home,
@@ -183,6 +190,16 @@ index-fraction method over `series`, are fallbacks for summaries without `series
 nocturnal HRV is stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery —
 which is why Oura's own app has no per-night HRV trend either.
 
+**On-device SleepNet input assembly** is the same kind of duplicated pair: iOS
+`SleepStaging.nightInputs` (`SleepStaging.swift`) and Android `SleepStaging.nightInputs`
+(`models/SleepStaging.kt`) both gather the 0x60/0x80 beats, 0x5d HRV, 0x47 motion and
+0x75/0x46 temperature from the synced DB, apply the Gen-4 gates (0x60 tail-noise, 0x80
+quality, 0x60/0x80 dedup, 0x5d synthetic beats), and place SleepNet's end-stamped output on
+the true 30 s grid via `Sleep.alignedStages`. Change one, change the other. The Kotlin copy
+carries the JVM tests (`testFull` `SleepNightInputsTest`, `SleepStagingTest`), including the
+synthetic-beat loop whose `tCur` must advance in ms (a `Float` accumulator stalls at epoch-ms
+magnitudes and spins forever).
+
 ## Known gaps
 
 ### iOS-only, not yet on the web
@@ -207,7 +224,8 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   (`[unix, value]` points, gaps kept). iOS still spreads `nights[].series` evenly over the
   night, which mis-times a lane whose stream stops early (the 5-min HR averages end at wake).
 - **15-minute heart-rate slots**: the web Heart rate tab defaults to 15-minute bars
-  (`hr_bins`, with a 15 min / 1 h switch); iOS `HeartRate.swift` still shows hourly bars.
+  (`hr_bins`, with a 15 min / 1 h switch); iOS `HeartRate.swift` still shows hourly bars,
+  and Android `ui/HeartRate.kt` is hourly too (the missing item for both natives).
 - **Live heart rate** panel: `POST /api/live-hr` streams beats from `oura live-hr`
   (one minute per session, stoppable) as newline-delimited JSON.
 
@@ -233,16 +251,8 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 
 ### Not yet on Android
 
-- **Sleep staging fixes for Gen 4 rings** (iOS `SleepStaging.nightInputs`: separate 0x60/0x80
-  beats with quality gating, synthetic beats from 0x5d, 0x75 temperature, end-time epoch
-  alignment `Sleep.alignedStages`, `estimateStages` fallback, `refineDeepStages`) and the
-  matching `torch_bridge` timestamps output — `models/SleepStaging.kt` is the old pipeline.
-- **Ring clock dating rules** (0x85 RTC beacons, 0x41 `ring_start`, stalls, undated data) in
-  `data/EventStore.kt`; the on-device models still use the older 0x42-only mapping.
-- **Activity model resilience** (never abort on one bad day, failed-day cache, MET dedup).
-- **Pair a factory-reset ring / factory reset** (`RingSession.pair`, `factory_reset`).
-- **Per-day "Refresh analysis"** buttons; the full flavor reruns models through its cache.
-- **Battery history chart** (web-only upstream too; the field is decoded on Android).
+- None — every feature that is not deliberately web-only is here. See "Web-only, not yet
+  on iOS" (15-minute heart-rate slots) for what is still missing from both native apps.
 
 ### Android-specific divergences (deliberate, not bugs)
 
@@ -401,8 +411,8 @@ continues. `oura-summary::normalize_bed_periods` repairs the model boundary in t
 Pulse evidence is deliberately gated: each burst needs multiple firmware-accepted heart
 rate estimates, consecutive bursts can be at most 15 minutes apart, and naps or clean
 bedtime ends never use daytime pulse sampling. The resulting canonical `start_ds/end_ds`
-is passed unchanged to the Python SleepNet runner and iOS `SleepStaging`, so both clients
-score the same recovered window. Regression tests include isolated daytime HR, long gaps,
+is passed unchanged to the Python SleepNet runner and iOS/Android `SleepStaging`, so all
+clients score the same recovered window. Regression tests include isolated daytime HR, long gaps,
 periodic post-nap sampling, and the extracted Ring 5 brief-wake vector.
 
 The polysomnograph's skin-temperature lane uses only `sleep_temp_event`. Generic

@@ -19,12 +19,14 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import md.thomas.openoura.diag.Diagnostics.log
 import md.thomas.openoura.store.DB
+import md.thomas.openoura.store.KnownRing
 import md.thomas.openoura.store.Prefs
 import md.thomas.openoura.store.RingKeyStore
 import md.thomas.openoura.store.isValidRingKey
 import md.thomas.openoura.store.secretFingerprint
 import uniffi.oura_core.BleWriter
 import uniffi.oura_core.HeartRateListener
+import uniffi.oura_core.PairReport
 import uniffi.oura_core.RingSession
 import uniffi.oura_core.SyncProgressListener
 import uniffi.oura_core.SyncReport
@@ -91,6 +93,14 @@ class SyncEngine(private val context: Context) {
             val s = message.lowercase()
             return s.contains("authentication failed") || s.contains("ring rejected auth")
         }
+
+        /**
+         * The ring serial must be known (a sync or pair has seen it) and a valid key held:
+         * the wipe authenticates with that key and only proceeds when the answering ring
+         * reports this exact serial. Mirrors iOS `OuraApp`'s factory-reset `disabled:`.
+         */
+        internal fun canFactoryReset(knownSerial: String?, key: String): Boolean =
+            knownSerial != null && isValidRingKey(key)
 
         internal fun fmtBytes(b: ULong): String =
             if (b >= 1_048_576uL) "%.1f MB".format(b.toDouble() / 1_048_576)
@@ -264,6 +274,7 @@ class SyncEngine(private val context: Context) {
                         )
                     }
                     RingKeyStore.save(context, key)
+                    KnownRing.save(context, report.serial) // remembered for factory-reset gating
                     val completedAt = System.currentTimeMillis()
                     Prefs.of(context).edit()
                         .putLong(Prefs.LAST_SUCCESSFUL_SYNC_AT, completedAt)
@@ -437,6 +448,126 @@ class SyncEngine(private val context: Context) {
                 }
             }
         } finally {
+            runLock.unlock()
+        }
+    }
+
+    /**
+     * Adopt a **factory-reset** ring from the phone alone: connect, install a freshly minted
+     * 16-byte auth key, and return the [PairReport] (the caller persists `keyHex` + `serial`).
+     * `existingKeyHex` re-installs a key already held instead of minting one. A ring that
+     * still holds a key rejects this; reset it first. Mirrors `RingSync.pair` on iOS.
+     *
+     * Takes the same single-flight lock as [run]/[liveHeartRate] — the ring has one BLE link.
+     */
+    suspend fun pair(
+        existingKeyHex: String? = null,
+        onStatus: (String) -> Unit,
+    ): PairReport? {
+        if (BlePermissions.missing(context).isNotEmpty()) {
+            onStatus("Bluetooth permission is required — grant it and try again")
+            return null
+        }
+        if (!runLock.tryLock()) {
+            onStatus("a ring sync is in progress — try again when it finishes")
+            return null
+        }
+        WakeLockOwner.acquire(context, "pair-screen")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        var transported: BleTransport? = null
+        try {
+            onStatus("looking for a ring on its charger…")
+            val t = BleTransport(context, nameContains = "Oura")
+            transported = t
+            try {
+                t.connect()
+            } catch (e: Throwable) {
+                log("pair", "BLE connect FAILED: $e")
+                onStatus(
+                    "couldn't connect (${e.message ?: e}) — put the reset ring on its " +
+                        "charger next to this phone"
+                )
+                return null
+            }
+
+            val session = RingSession(RingWriter(t, scope))
+            scope.launch { t.notifications().consumeEach { session.pushFrame(it) } }
+
+            onStatus("installing a new key…")
+            val report = withContext(Dispatchers.IO) { session.pair(existingKeyHex) }
+            log("pair", "paired ${report.serial} minted=${report.minted}")
+            onStatus("paired with ${report.serial} — key saved. Back it up: it can't be read off the ring")
+            return report
+        } catch (e: Throwable) {
+            log("pair", "FAILED: ${e.message ?: e}")
+            onStatus("pairing failed: ${e.message ?: e}")
+            return null
+        } finally {
+            scope.cancel()
+            transported?.shutdown()
+            WakeLockOwner.release("pair-screen")
+            runLock.unlock()
+        }
+    }
+
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: its installed auth key, every BLE
+     * bond, the on-ring event buffer and the stored body profile. The caller drops the stored
+     * key afterwards (it no longer opens anything). Only proceeds when the answering ring
+     * reports [confirmSerial], so a tap can never wipe a different ring on the charger.
+     * Returns the wiped serial, or null on failure. Mirrors `RingSync.factoryReset` on iOS.
+     */
+    suspend fun factoryReset(
+        keyHex: String,
+        confirmSerial: String,
+        onStatus: (String) -> Unit,
+    ): String? {
+        if (!isValidRingKey(keyHex)) {
+            onStatus("a valid 32-hex key is required to reset the ring")
+            return null
+        }
+        if (BlePermissions.missing(context).isNotEmpty()) {
+            onStatus("Bluetooth permission is required — grant it and try again")
+            return null
+        }
+        if (!runLock.tryLock()) {
+            onStatus("a ring sync is in progress — try again when it finishes")
+            return null
+        }
+        WakeLockOwner.acquire(context, "pair-screen")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        var transported: BleTransport? = null
+        try {
+            onStatus("looking for $confirmSerial…")
+            val t = BleTransport(context, nameContains = "Oura")
+            transported = t
+            try {
+                t.connect()
+            } catch (e: Throwable) {
+                log("reset", "BLE connect FAILED: $e")
+                onStatus(
+                    "couldn't connect (${e.message ?: e}) — put the ring on its charger " +
+                        "next to this phone"
+                )
+                return null
+            }
+
+            val session = RingSession(RingWriter(t, scope))
+            scope.launch { t.notifications().consumeEach { session.pushFrame(it) } }
+
+            onStatus("erasing…")
+            val serial = withContext(Dispatchers.IO) { session.factoryReset(keyHex, confirmSerial) }
+            log("reset", "wiped $serial")
+            onStatus("$serial wiped. Its old key is gone — pair it again to start over.")
+            return serial
+        } catch (e: Throwable) {
+            log("reset", "FAILED: ${e.message ?: e}")
+            onStatus("reset failed: ${e.message ?: e}")
+            return null
+        } finally {
+            scope.cancel()
+            transported?.shutdown()
+            WakeLockOwner.release("pair-screen")
             runLock.unlock()
         }
     }

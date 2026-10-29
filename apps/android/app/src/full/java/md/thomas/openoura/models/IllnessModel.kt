@@ -8,6 +8,8 @@ import md.thomas.openoura.data.EventStore
 import md.thomas.openoura.data.IllnessBiomarker
 import md.thomas.openoura.data.IllnessResult
 import md.thomas.openoura.data.Profile
+import md.thomas.openoura.diag.Diagnostics.log
+import android.database.sqlite.SQLiteDatabase
 import java.util.TimeZone
 import kotlin.math.abs
 import kotlin.math.cos
@@ -35,6 +37,14 @@ object IllnessModel {
     private val TEMP_TAGS = setOf(0x46, 0x69, 0x75)
     private const val DAY = 86400.0
 
+    /** Sample caps. The gather loop keeps every sample; the newest MAX samples are
+     * retained afterwards (the model's 30-day window ends at the newest night), so an
+     * over-cap history loses its oldest data, never its most recent days. */
+    private const val MAX_IBI_SAMPLES = 50_000
+    private const val MAX_HRV_SAMPLES = 10_000
+    private const val MAX_TEMP_SAMPLES = 10_000
+    private const val MAX_WINDOWS = 100
+
     private class Nightly(
         val breath: Double,
         val avgHr: Double,
@@ -55,6 +65,8 @@ object IllnessModel {
         val modelPath = ModelAssets.path(context, MODEL)
             ?: return Outcome(null, "illness model file missing from the app assets")
         if (events.isEmpty()) return Outcome(null, null)
+
+        log("illness", "starting with ${events.size} events")
 
         fun u(ds: Long, cu: Long) = clock.unixSeconds(ds, cu)
         val tz = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000.0
@@ -127,6 +139,21 @@ object IllnessModel {
             }
         }
 
+        // Keep only the most recent samples: the model reads a 30-day window ending at the
+        // anchor (the newest night), so a cap must drop the oldest data, never the newest.
+        fun keepLast(t: ArrayList<Double>, others: List<ArrayList<Double>>, max: Int) {
+            val drop = t.size - max
+            if (drop > 0) {
+                t.subList(0, drop).clear()
+                others.forEach { it.subList(0, drop).clear() }
+            }
+        }
+        keepLast(ibiT, listOf(ibiV), MAX_IBI_SAMPLES)
+        keepLast(tempT, listOf(tempV), MAX_TEMP_SAMPLES)
+        keepLast(hrvT, listOf(hrvR, hrvH), MAX_HRV_SAMPLES)
+        if (windows.size > MAX_WINDOWS) windows.subList(0, windows.size - MAX_WINDOWS).clear()
+        log("illness", "gathered ibi=${ibiT.size} hrv=${hrvT.size} temp=${tempT.size} windows=${windows.size}")
+
         // ── per wake-day nightly biometrics (longest sleep wins) ──────────────
         val perDay = HashMap<Int, Nightly>()
         for ((start, end) in windows) {
@@ -151,6 +178,7 @@ object IllnessModel {
             if (existing == null || dur > existing.dur) perDay[wakeDay] = n
         }
         val anchor = perDay.keys.maxOrNull() ?: return Outcome(null, null)
+        log("illness", "perDay nights=${perDay.size} anchor=$anchor")
 
         // ── 30-day columns (index 0 = today) ──────────────────────────────────
         fun col(pick: (Nightly) -> Double) = FloatArray(N_DAYS) { i ->
@@ -223,9 +251,11 @@ object IllnessModel {
         listOf(breath, avgHr, lowHr, hrv, tempDev, sedC, restC).forEachIndexed { k, c ->
             c.copyInto(series, k * N_DAYS)
         }
+        log("illness", "running inference series=${series.size} scalars=${scalars.size}")
 
         val out = TorchBridge.illness(modelPath, series, scalars)
             ?: return Outcome(null, "illness inference failed")
+        log("illness", "inference complete score=${out[0]} decision=${out[1]}")
 
         val score = out[0].toDouble()
         val decision = out[1].roundToInt()
@@ -272,6 +302,10 @@ object IllnessModel {
     private const val RESP_HI = 0.40
     private const val WIN_S = 60.0
     private const val STEP_S = 30.0
+    /** Maximum resampled signal length. The 18 h span guard bounds it at 18 · 3600 · 4 =
+     * 259,200, so this is only a safety margin above that — a lower value would silently
+     * NaN every long (≥ ~14 h) night's respiratory rate. */
+    private const val MAX_RESAMPLE_LEN = 260_000
 
     fun respiratoryRate(ts: List<Double>, ibi: List<Double>): Double {
         // ectopic filter: physiological range, then within 30% of the median
@@ -295,6 +329,7 @@ object IllnessModel {
         if (span > 18 * 3600) return Double.NaN
         val n = (span * FS).toInt()
         if (n < (WIN_S * FS).toInt()) return Double.NaN
+        if (n > MAX_RESAMPLE_LEN) return Double.NaN
 
         // 4 Hz resample (linear interpolation on the IBI tachogram)
         var x = DoubleArray(n)

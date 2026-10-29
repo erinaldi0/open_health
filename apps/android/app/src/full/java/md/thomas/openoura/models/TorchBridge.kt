@@ -29,7 +29,9 @@ object TorchBridge {
     /**
      * SleepNet (moonstone) → per-30s stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE), matching
      * tools/run_sleep_model.py. `ibiVal` is row-major n×3 (ibi_ms, amplitude, valid);
-     * `acmVal`/`tempVal` are n×1. Timestamps are absolute epoch-ms.
+     * `acmVal`/`tempVal` are n×1. Timestamps are absolute epoch-ms. Returns the stage
+     * array (or null on failure) and writes each epoch's END timestamp into
+     * `outTimestampsMs` (which bounds the epoch count), for placement on the true grid.
      */
     external fun sleepnet(
         modelPath: String,
@@ -37,6 +39,7 @@ object TorchBridge {
         acmTs: LongArray, acmVal: FloatArray,
         tempTs: LongArray, tempVal: FloatArray,
         bedtimeStartMs: Long, bedtimeEndMs: Long,
+        outTimestampsMs: LongArray,
     ): IntArray?
 
     /**

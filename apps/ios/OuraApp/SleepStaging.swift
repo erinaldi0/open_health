@@ -234,12 +234,12 @@ enum SleepStaging {
                     let rmssd = i < rmssds.count ? rmssds[i].floatValue : 30.0
                     let jitter = min(max(rmssd * 0.5, 4.0), 60.0)
                     let slotStart = ts0 + Int64(i) * stepMs
-                    var tCur = Float(slotStart)
+                    var tCur = Double(slotStart)
                     var k = 0
                     while Int64(tCur) < slotStart + stepMs {
                         let sign: Float = (k % 2 == 0) ? 1.0 : -1.0
                         let ibi = min(max((meanIbi + sign * jitter * 0.5).rounded(), 330.0), 1950.0)
-                        tCur += ibi
+                        tCur += Double(ibi)
                         synth.append((Int64(tCur), ibi, 1200.0, 1.0))
                         k += 1
                     }

@@ -1,11 +1,14 @@
 package md.thomas.openoura.data
 
 import java.time.LocalDate
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 // ── science: hypnogram-derived metrics (mirror of oura-summary sleep_metrics) ──
 //
@@ -317,6 +320,263 @@ object Sleep {
         if (n == 0 || !fullyStaged(stages)) return 0
         val epochS = inBedS / n
         return (stages.count { it in 1..3 } * epochS).toInt()
+    }
+
+    /**
+     * Preserve SleepNet's absolute 30-second grid instead of stretching its output.
+     * Mirror of iOS `Sleep.alignedStages` and `oura-summary`'s alignment. SleepNet stamps
+     * each epoch with its END time: the first output is start+30 s and the last lands on
+     * (or just past) the bedtime end. Epoch k covers (t-30 s, t]; reading t as the start
+     * left epoch 0 unknown and dropped the last one, so every night was reported
+     * incomplete. Returns null when the grid can't be trusted.
+     */
+    fun alignedStages(timestamps: List<Long>, stages: List<Int>, startMs: Long, endMs: Long): List<Int>? {
+        if (timestamps.size != stages.size) return null
+        if (endMs <= startMs || endMs - startMs > 48L * 3600 * 1000) return null
+        if (!stages.all { it in 1..4 }) return null
+        for (i in 0 until timestamps.size - 1) {
+            if (timestamps[i] >= timestamps[i + 1]) return null
+        }
+        val span = endMs - startMs
+        val aligned = MutableList(max(1, ((span + 29_999) / 30_000).toInt())) { 0 }
+        timestamps.forEachIndexed { i, timestamp ->
+            if (timestamp <= startMs) return@forEachIndexed
+            val index = ((timestamp - startMs - 1) / 30_000).toInt()
+            if (index < aligned.size) aligned[index] = stages[i]
+        }
+        return aligned
+    }
+
+    /** Linear-interpolated percentile over [values]. Mirror of iOS `Reports.percentile`. */
+    private fun percentile(values: List<Double>, q: Double): Double {
+        if (values.isEmpty()) return 0.0
+        val sorted = values.sorted()
+        val pos = min(max(q, 0.0), 1.0) * (sorted.size - 1)
+        val lo = floor(pos).toInt()
+        val hi = ceil(pos).toInt()
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo)
+    }
+
+    /** Per-30 s HR/HRV/motion grid used by the signal-based staging fallback. */
+    class EpochSignalGrid(val hr: List<Double?>, val hrv: List<Double?>, val motion: List<Double>)
+
+    /**
+     * Place each overnight series on an [n]-epoch grid by true timestamp, preferring the
+     * timestamped `series_t` then the flat legacy `series`. Mirror of iOS `epochSignalGrid`.
+     */
+    private fun epochSignalGrid(night: NightRow, n: Int): EpochSignalGrid? {
+        if (n < 20) return null
+        val startS = (night.startUnix ?: 0L).toDouble()
+        val endS = (night.endUnix ?: night.durationS.toLong()).toDouble()
+        val spanS = if (endS > startS) endS - startS else max(night.durationS, n * 30.0)
+        if (spanS <= 0) return null
+        val stepS = spanS / n
+
+        fun interpolate(pts: List<List<Double>>, fallback: List<Double>, maxHoldS: Double): List<Double?> {
+            var pairs = pts.mapNotNull { p ->
+                if (p.size < 2 || !p[0].isFinite() || !p[1].isFinite() || p[1] <= 0) null
+                else p[0] to p[1]
+            }
+            if (pairs.isEmpty() && fallback.size > 1) {
+                pairs = fallback.mapIndexedNotNull { i, v ->
+                    if (!v.isFinite() || v <= 0) null
+                    else (startS + spanS * i / (fallback.size - 1)) to v
+                }
+            }
+            if (pairs.isEmpty()) return List(n) { null }
+            pairs = pairs.sortedBy { it.first }
+            val out = arrayOfNulls<Double>(n)
+            var cursor = 0
+            for (idx in 0 until n) {
+                val center = startS + (idx + 0.5) * stepS
+                while (cursor + 1 < pairs.size && pairs[cursor + 1].first <= center) cursor++
+                var best = pairs[cursor]
+                if (cursor + 1 < pairs.size &&
+                    abs(pairs[cursor + 1].first - center) < abs(best.first - center)
+                ) {
+                    best = pairs[cursor + 1]
+                }
+                if (abs(best.first - center) <= maxHoldS) out[idx] = best.second
+            }
+            return out.toList()
+        }
+
+        val hr = interpolate(night.seriesT?.hr ?: emptyList(), night.series?.hr ?: emptyList(), 450.0)
+        val hrv = interpolate(night.seriesT?.hrv ?: emptyList(), night.series?.hrv ?: emptyList(), 450.0)
+        val motion = DoubleArray(n)
+        val timedMotion = night.seriesT?.motion
+        if (!timedMotion.isNullOrEmpty()) {
+            for (p in timedMotion) {
+                if (p.size < 2 || !p[0].isFinite() || !p[1].isFinite()) continue
+                val f = (p[0] - startS) / spanS
+                if (f < -1e-6 || f > 1 + 1e-6) continue
+                val idx = min(max((f * n).toInt(), 0), n - 1)
+                if (p[1] > motion[idx]) motion[idx] = p[1]
+            }
+        } else {
+            val mVals = night.series?.motion
+            if (!mVals.isNullOrEmpty()) {
+                val mTimes = night.series?.motionTime
+                mVals.forEachIndexed { i, v ->
+                    if (v.isFinite()) {
+                        val f = if (mTimes != null && i < mTimes.size) mTimes[i]
+                        else i.toDouble() / max(1, mVals.size - 1)
+                        val idx = min(max((f * n).toInt(), 0), n - 1)
+                        if (v > motion[idx]) motion[idx] = v
+                    }
+                }
+            }
+        }
+        return EpochSignalGrid(hr, hrv, motion.toList())
+    }
+
+    /**
+     * Recover physiological N3 (Deep) bouts when Oura Gen 4 sparse IBI streams cause
+     * SleepNet to collapse N3 into N2 (0% Deep across a full night). Mirror of iOS
+     * `Sleep.refineDeepStages` / `oura-summary::refine_deep_stages`.
+     */
+    fun refineDeepStages(stages: List<Int>, night: NightRow): List<Int> {
+        val n = stages.size
+        if (n < 40 || !stages.all { it in 1..4 } || stages.contains(1) ||
+            stages.count { it == 2 } < 20
+        ) {
+            return stages
+        }
+        val grid = epochSignalGrid(night, n) ?: return stages
+        val hrValid = grid.hr.filterNotNull()
+        if (hrValid.size < 6) return stages
+        val hrQ35 = percentile(hrValid, 0.35)
+        val hrQ50 = percentile(hrValid, 0.50)
+        val hrvValid = grid.hrv.filterNotNull()
+        val hrvQ45 = if (hrvValid.size >= 4) percentile(hrvValid, 0.45) else 0.0
+        val posMotion = grid.motion.filter { it > 0 }
+        val quietMotion = if (posMotion.isEmpty()) 2.0 else max(2.0, min(6.0, percentile(posMotion, 0.35)))
+
+        val candidates = BooleanArray(n) { idx ->
+            if (stages[idx] != 2) return@BooleanArray false
+            val frac = idx.toDouble() / max(1, n - 1)
+            if (frac > 0.78 || grid.motion[idx] > quietMotion) return@BooleanArray false
+            val lo = max(0, idx - 3)
+            val hi = min(n, idx + 4)
+            if ((lo until hi).any { stages[it] == 4 || stages[it] == 3 }) return@BooleanArray false
+            val h = grid.hr[idx] ?: return@BooleanArray false
+            val hCap = if (frac <= 0.55) hrQ50 else hrQ35
+            if (h > hCap + 0.5) return@BooleanArray false
+            val hrs = (lo until hi).mapNotNull { grid.hr[it] }
+            if (hrs.size >= 3) {
+                val mean = hrs.sum() / hrs.size
+                val variance = hrs.sumOf { (it - mean) * (it - mean) } / hrs.size
+                if (sqrt(variance) > 3.2) return@BooleanArray false
+            }
+            if (hrvQ45 > 0) {
+                val v = grid.hrv[idx]
+                if (v != null && v < hrvQ45 * 0.75 && h > hrQ35) return@BooleanArray false
+            }
+            true
+        }
+
+        val smoothed = candidates.copyOf()
+        if (n >= 3) {
+            for (idx in 1 until n - 1) {
+                if (!smoothed[idx] && candidates[idx - 1] && candidates[idx + 1] && stages[idx] == 2) {
+                    smoothed[idx] = true
+                }
+            }
+        }
+        val refined = stages.toMutableList()
+        val maxDeep = max(8, (n * 0.24).toInt())
+        var assigned = 0
+        var idx = 0
+        while (idx < n) {
+            if (smoothed[idx]) {
+                var end = idx + 1
+                while (end < n && smoothed[end]) end++
+                if (end - idx >= 6) {
+                    var j = idx
+                    while (j < end && assigned < maxDeep) {
+                        refined[j] = 1
+                        assigned++
+                        j++
+                    }
+                }
+                idx = end
+            } else {
+                idx++
+            }
+        }
+        return refined
+    }
+
+    /**
+     * Physiological 4-stage hypnogram estimator when Torch SleepNet cannot run on a night
+     * (e.g. Gen 4 nights with sparse raw PPG beats or model failure) yet valid overnight
+     * HR/HRV/temp/motion series are present. Mirror of iOS `Sleep.estimateStages` /
+     * `oura-summary::stage_night_from_signals`.
+     */
+    fun estimateStages(night: NightRow): List<Int>? {
+        val su = night.startUnix
+        val eu = night.endUnix
+        val spanS: Double = if (su != null && eu != null && eu > su) (eu - su).toDouble() else night.durationS
+        val n = (spanS / 30.0).toInt()
+        if (n !in 40..1920) return null
+        val grid = epochSignalGrid(night, n) ?: return null
+        val hrValid = grid.hr.filterNotNull()
+        val hrvValid = grid.hrv.filterNotNull()
+        if (hrValid.size < 6 && hrvValid.size < 6) return null
+
+        val hrQ35 = if (hrValid.isEmpty()) 58.0 else percentile(hrValid, 0.35)
+        val hrQ65 = if (hrValid.isEmpty()) 64.0 else percentile(hrValid, 0.65)
+        val hrQ85 = if (hrValid.isEmpty()) 70.0 else percentile(hrValid, 0.85)
+        val hrvQ35 = if (hrvValid.isEmpty()) 30.0 else percentile(hrvValid, 0.35)
+        val hrvQ65 = if (hrvValid.isEmpty()) 50.0 else percentile(hrvValid, 0.65)
+        val posMotion = grid.motion.filter { it > 0 }
+        val wakeMotion = if (posMotion.isEmpty()) 12.0 else max(8.0, percentile(posMotion, 0.85))
+        val quietMotion = if (posMotion.isEmpty()) 2.0 else max(2.0, min(5.0, percentile(posMotion, 0.30)))
+
+        val rawStages = MutableList(n) { 2 }
+        for (idx in 0 until n) {
+            val frac = idx.toDouble() / max(1, n - 1)
+            val m = grid.motion[idx]
+            val h = grid.hr[idx]
+            val v = grid.hrv[idx]
+            val edge = idx < 6 || idx + 6 >= n
+
+            val lo = max(0, idx - 3)
+            val hi = min(n, idx + 4)
+            val hrs = (lo until hi).mapNotNull { grid.hr[it] }
+            val hrStd: Double = if (hrs.size < 3) {
+                1.5
+            } else {
+                val mean = hrs.sum() / hrs.size
+                sqrt(hrs.sumOf { (it - mean) * (it - mean) } / hrs.size)
+            }
+
+            if (m >= wakeMotion || (edge && m > quietMotion) || ((h ?: 0.0) >= hrQ85 + 2.0 && m > quietMotion)) {
+                rawStages[idx] = 4
+                continue
+            }
+            val cyclePhase = sin(2.0 * PI * (spanS * frac / 5400.0 - 0.25))
+            if (frac >= 0.12 && m <= quietMotion * 1.5 &&
+                (hrStd >= 2.0 || (cyclePhase > 0.35 && (h ?: hrQ65) >= hrQ35))
+            ) {
+                if (v != null && v >= hrvQ65 && (h ?: hrQ65) > hrQ35) {
+                    rawStages[idx] = 3
+                    continue
+                } else if (hrStd >= 2.2 && frac >= 0.20) {
+                    rawStages[idx] = 3
+                    continue
+                }
+            }
+            if (frac <= 0.72 && m <= quietMotion && (h ?: (hrQ35 + 1.0)) <= hrQ35 + 0.5 && hrStd <= 2.5) {
+                if ((v ?: hrvQ35) >= hrvQ35 * 0.85) {
+                    rawStages[idx] = 1
+                    continue
+                }
+            }
+            rawStages[idx] = 2
+        }
+        val smoothed = smooth(rawStages, 5)
+        return refineDeepStages(smoothed, night)
     }
 }
 

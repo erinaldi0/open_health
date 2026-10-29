@@ -46,7 +46,12 @@ class FNV64 {
 }
 
 @Serializable
-data class ActivityDayEntry(val fp: String, val sessions: List<WorkoutSession>)
+data class ActivityDayEntry(
+    val fp: String,
+    val sessions: List<WorkoutSession>,
+    /** The model rejected this day; cached so one degenerate day is not retried every run. */
+    val failed: Boolean = false,
+)
 
 @Serializable
 data class StagedNightEntry(val fp: String, val stages: List<Int>)

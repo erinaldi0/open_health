@@ -435,6 +435,35 @@ data class Summary(
     fun workoutsOn(day: String): List<WorkoutSession> =
         workouts.filter { it.isWorkout >= 0.5 && it.dayLabel == day }
 
+    /**
+     * Replace the night the user woke from on [day] with [replacement], or append it when
+     * the current nights have no matching start. Matches by the current bedtime first, then
+     * by the old start this day reported, then by the raw ring bedtime — so a night whose
+     * sleep was re-windowed keeps its slot. Port of the iOS `refreshAnalysis` replacement.
+     */
+    fun replacingNight(day: String, replacement: NightRow): Summary {
+        val previousStart = nightForDay(day)?.startDs
+        val rawStart = replacement.rawStartDs
+        val list = nights.toMutableList()
+        val index = list.indexOfFirst {
+            it.startDs == replacement.startDs ||
+                (previousStart != null && it.startDs == previousStart) ||
+                (rawStart != null && it.rawStartDs == rawStart)
+        }
+        if (index >= 0) list[index] = replacement else list.add(replacement)
+        return copy(nights = list)
+    }
+
+    /**
+     * Replace [day]'s detected sessions with [sessions] (the rerun's only-day output) and
+     * drop the stale aggregate activity failure message, which names only the first failed
+     * day and is wrong once it reruns cleanly. Port of the iOS `refreshAnalysis` activity path.
+     */
+    fun replacingWorkouts(day: String, sessions: List<WorkoutSession>): Summary = copy(
+        workouts = (workouts.filterNot { it.dayLabel == day } + sessions).sortedBy { it.start },
+        modelErrors = modelErrors.filterNot { it.startsWith("Activity analysis failed for") },
+    )
+
     /** One value per wake-date (longest night wins), oldest first — feeds vital trend charts. */
     fun nightlySeries(pick: (NightRow) -> Double?): List<DatedVital> {
         val byDay = HashMap<String, Pair<Double, Double>>() // day → (in-bed hours, value)

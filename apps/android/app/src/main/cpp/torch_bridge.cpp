@@ -80,7 +80,9 @@ extern "C" {
 
 /**
  * SleepNet (moonstone) → per-30s hypnogram stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE),
- * matching tools/run_sleep_model.py. Returns the stage array, or null on failure.
+ * matching tools/run_sleep_model.py. Returns the stage array, or null on failure, and
+ * writes each epoch's absolute Unix-ms END timestamp into `out_timestamps_ms` (which
+ * bounds the epoch count) so the caller can place the output on its true 30 s grid.
  */
 JNIEXPORT jintArray JNICALL
 Java_md_thomas_openoura_models_TorchBridge_sleepnet(
@@ -88,7 +90,8 @@ Java_md_thomas_openoura_models_TorchBridge_sleepnet(
         jlongArray ibi_ts, jfloatArray ibi_val,
         jlongArray acm_ts, jfloatArray acm_val,
         jlongArray temp_ts, jfloatArray temp_val,
-        jlong bedtime_start_ms, jlong bedtime_end_ms) {
+        jlong bedtime_start_ms, jlong bedtime_end_ms,
+        jlongArray out_timestamps_ms) {
     Utf8 path(env, model_path);
     LongArr ibiTs(env, ibi_ts); FloatArr ibiVal(env, ibi_val);
     LongArr acmTs(env, acm_ts); FloatArr acmVal(env, acm_val);
@@ -126,7 +129,17 @@ Java_md_thomas_openoura_models_TorchBridge_sleepnet(
             return nullptr;
         }
         auto col0 = staging.select(1, 0).to(at::kInt).contiguous();
+        auto timestamps = out->elements()[0].toTensor().to(at::kLong).reshape({-1}).contiguous();
+        if (timestamps.numel() != col0.numel()) {
+            LOGE("sleepnet: mismatched timestamps or output exceeds buffer");
+            return nullptr;
+        }
         jsize n = (jsize)col0.numel();
+        if (n > env->GetArrayLength(out_timestamps_ms)) {
+            LOGE("sleepnet: timestamps exceed output buffer");
+            return nullptr;
+        }
+        env->SetLongArrayRegion(out_timestamps_ms, 0, n, (const jlong *)timestamps.data_ptr<int64_t>());
         jintArray result = env->NewIntArray(n);
         if (!result) return nullptr;
         env->SetIntArrayRegion(result, 0, n, (const jint *)col0.data_ptr<int>());

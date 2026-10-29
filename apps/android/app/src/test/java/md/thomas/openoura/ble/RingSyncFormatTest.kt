@@ -1,6 +1,7 @@
 package md.thomas.openoura.ble
 
 import md.thomas.openoura.store.isValidRingKey
+import md.thomas.openoura.store.validRingSerial
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -28,6 +29,24 @@ class RingSyncFormatTest {
         assertTrue(SyncEngine.isAuthenticationFailure("Ring rejected auth key"))
         assertFalse(SyncEngine.isAuthenticationFailure("BLE link lost mid-batch"))
         assertFalse(SyncEngine.isAuthenticationFailure("extended history request failed with result code 0xff"))
+    }
+
+    @Test
+    fun `a remembered serial ignores blanks and the unknown placeholder`() {
+        // iOS rememberSerial refuses these; the factory-reset gate reads the same value.
+        assertEquals("2D1A", validRingSerial("  2D1A  "))
+        assertEquals(null, validRingSerial(null))
+        assertEquals(null, validRingSerial("   "))
+        assertEquals(null, validRingSerial("unknown"))
+        assertEquals(null, validRingSerial("Unknown"))
+    }
+
+    @Test
+    fun `factory-reset needs a known serial and a valid key`() {
+        val key = "0123456789abcdef0123456789ABCDEF"
+        assertTrue(SyncEngine.canFactoryReset("2D1A", key))
+        assertFalse(SyncEngine.canFactoryReset(null, key))       // no serial seen yet
+        assertFalse(SyncEngine.canFactoryReset("2D1A", "short")) // no key to authenticate
     }
 
     @Test

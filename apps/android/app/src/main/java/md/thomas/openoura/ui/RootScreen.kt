@@ -174,6 +174,7 @@ fun RootScreen(
                         device.batteryPct?.let { "$it%" } ?: "—",
                         accent = if ((device.batteryPct ?: 100) < 20) colors.bad else colors.ink,
                     )
+                    if (device.batteryHistory.size >= 2) BatteryHistoryChart(device.batteryHistory)
                     (device.rawEvents ?: device.totalEvents)?.let { raw ->
                         ObsStat("events", device.decodedEvents?.let { "$raw raw · $it decoded" } ?: "$raw")
                     }

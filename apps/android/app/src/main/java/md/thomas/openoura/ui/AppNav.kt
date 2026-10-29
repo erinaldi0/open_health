@@ -113,6 +113,8 @@ fun AppNav(vm: SummaryViewModel, ring: RingSync, modifier: Modifier = Modifier) 
             onBack = { route = Route.Home },
             modifier = base,
             onSummaryChanged = { vm.reload() },
+            busy = vm.loading || vm.refreshingDay || ring.busy,
+            onRefreshDay = { day, kind -> vm.refreshDay(day, kind) },
         )
 
         Route.AllDays -> if (s == null) route = Route.Home else AllDaysScreen(

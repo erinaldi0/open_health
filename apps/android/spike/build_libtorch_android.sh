@@ -49,6 +49,15 @@ cd "$SRC"
 git submodule deinit -f third_party/flash-attention 2>/dev/null || true
 git submodule update --init --recursive 2>&1 | tail -3
 
+# Patch ThreadPool.cc to replace stderr/stdout with Android logging (bionic has no stderr)
+if [ -f c10/core/ThreadPool.cc ]; then
+    echo "==> patching ThreadPool.cc for Android"
+    sed -i 's|stderr|__android_log_write(ANDROID_LOG_ERROR, "torch", |g' c10/core/ThreadPool.cc
+    sed -i 's|stdout|__android_log_write(ANDROID_LOG_INFO, "torch", |g' c10/core/ThreadPool.cc
+    sed -i 's|fprintf(stderr|__android_log_write(ANDROID_LOG_ERROR, "torch", |g' c10/core/ThreadPool.cc
+    sed -i 's|fprintf(stdout|__android_log_write(ANDROID_LOG_INFO, "torch", |g' c10/core/ThreadPool.cc
+fi
+
 # PyTorch's build generates C++ from Python during configure; it needs a host interpreter
 # with pyyaml + typing_extensions, independent of the Android target. Prefer the repo venv
 # (the iOS script does the same) because modern distros refuse `pip install --user`.
@@ -95,6 +104,8 @@ cmake -GNinja -S . -B "$BUILDDIR" \
   -DUSE_PYTORCH_QNNPACK=OFF -DUSE_XNNPACK=ON \
   -DUSE_CUDA=OFF -DUSE_VULKAN=OFF -DUSE_NUMPY=OFF -DUSE_OPENMP=OFF \
   -DUSE_BLAS=OFF -DUSE_LAPACK=OFF \
+  -DUSE_KINETO=OFF -DEDGE_PROFILER_USE_KINETO=OFF \
+  -DUSE_LITE_INTERPRETER_PROFILER=OFF \
   -DCMAKE_INSTALL_PREFIX="$PWD/$BUILDDIR/install"
 
 echo "==> compile + install (long)"
