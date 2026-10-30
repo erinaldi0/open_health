@@ -156,6 +156,10 @@ data class NightRow(
     /** The full-resolution hypnogram (one code per 30 s epoch; 0 = not staged). */
     @SerialName("stages_full") val stagesFull: List<Int>? = null,
     @SerialName("staging_source") val stagingSource: String? = null,
+    /** The official app's main chart: 30 s stages folded into 5-minute blocks. */
+    @SerialName("stages_5min") val stages5min: List<Int>? = null,
+    /** Wall-clock start (unix s) of the first NSSA epoch. */
+    @SerialName("stages_t0_unix") val stagesT0Unix: Double? = null,
     @SerialName("staging_coverage_pct") val stagingCoveragePct: Double? = null,
     @SerialName("staging_complete") val stagingCompleteJson: Boolean? = null,
     val series: NightSeries? = null,
@@ -190,6 +194,16 @@ data class NightRow(
 
     /** Key the on-device staging cache uses for this night (matches iOS `stagingKey`). */
     val stagingKey: String get() = "${startDs ?: 0}:${startUnix ?: capturedUnix ?: 0}"
+
+    /**
+     * Stages for metrics: Oura's hypnograms verbatim, our signal estimate smoothed
+     * (mirrors oura-summary's is_oura_staging / smooth_stages split).
+     */
+    val analysisStages: List<Int>
+        get() {
+            val st = hypnogram ?: emptyList()
+            return if (Sleep.isOuraStaging(stagingSource)) st else Sleep.smooth(st, 5)
+        }
 
     val hasSignals: Boolean
         get() = !(seriesT?.hr.isNullOrEmpty()) || !(series?.hr.isNullOrEmpty()) ||

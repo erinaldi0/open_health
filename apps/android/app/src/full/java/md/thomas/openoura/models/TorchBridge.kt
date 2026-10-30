@@ -27,20 +27,31 @@ object TorchBridge {
     val available: Boolean get() = loadError == null
 
     /**
-     * SleepNet (moonstone) → per-30s stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE), matching
-     * tools/run_sleep_model.py. `ibiVal` is row-major n×3 (ibi_ms, amplitude, valid);
-     * `acmVal`/`tempVal` are n×1. Timestamps are absolute epoch-ms. Returns the stage
-     * array (or null on failure) and writes each epoch's END timestamp into
-     * `outTimestampsMs` (which bounds the epoch count), for placement on the true grid.
+     * Oura's NSSA sleep stager (sleepstaging_2_6_0) over one ring bedtime — the port of
+     * TorchBridge.mm's oura_nssa, matching tools/nssa_stager.py. Inputs are built by
+     * NssaInputs (twin of tools/nssa_inputs.py): `acmVal` is row-major n×6
+     * [madIqr, madMax, madTmean, faIqr, faMax, faMean]; `ibiVal` is n×3
+     * [ibi, amplitude, validity] (ecore-corrected); `tempVal` is n; `demo` is
+     * [age, bmi, sex]. Returns the per-30s stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE)
+     * (or null on failure) and writes each epoch's start stamp into
+     * `outTimestampsMs` (which bounds the epoch count).
      */
-    external fun sleepnet(
+    external fun nssa(
         modelPath: String,
-        ibiTs: LongArray, ibiVal: FloatArray,
-        acmTs: LongArray, acmVal: FloatArray,
-        tempTs: LongArray, tempVal: FloatArray,
+        acmTs: LongArray, acmVal: FloatArray, nAcm: Int,
+        ibiTs: LongArray, ibiVal: FloatArray, nIbi: Int,
+        tempTs: LongArray, tempVal: FloatArray, nTemp: Int,
+        demo: FloatArray,
         bedtimeStartMs: Long, bedtimeEndMs: Long,
-        outTimestampsMs: LongArray,
+        outTimestampsMs: LongArray, maxOut: Int,
     ): IntArray?
+
+    /**
+     * Point `oura_ops::oura_sleep_classifier` at the bundled forest
+     * (sleepstaging_2_6_0_classifier.bin, see tools/extract_nssa_classifier.py).
+     * Must be called before the first [nssa] run.
+     */
+    external fun nssaSetClassifierPath(path: String)
 
     /**
      * Cardiovascular age. `ppg` is row-major nSegs×1500; `demo` is

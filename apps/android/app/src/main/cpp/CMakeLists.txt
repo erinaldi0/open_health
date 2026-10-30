@@ -5,7 +5,7 @@
 # same runtime apps/ios builds, which is what makes the two clients bit-exact on the same
 # .ptl files. Both the archives and the models are gitignored, exactly as on iOS.
 cmake_minimum_required(VERSION 3.22)
-project(oura_torch CXX)
+project(oura_torch C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,7 +26,11 @@ if(NOT EXISTS "${LIBTORCH}/include")
         "Or build the `lite` flavor, which needs no models at all.")
 endif()
 
-add_library(oura_torch SHARED torch_bridge.cpp)
+add_library(oura_torch SHARED torch_bridge.cpp NssaOps.c)
+
+# Like on iOS: the biquad relies on explicit fmaf() and no other contraction, so
+# GCC/Clang's default fp-contract would change the bit-exact results (NssaOps.h).
+set_source_files_properties(NssaOps.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 target_include_directories(oura_torch PRIVATE
     "${LIBTORCH}/include"

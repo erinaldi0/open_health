@@ -201,6 +201,32 @@ object Sleep {
         )
     }
 
+    /** Hypnograms from Oura's own staging (NSSA or the ring) are shown verbatim. */
+    fun isOuraStaging(source: String?): Boolean = source == "nssa" || source == "ring"
+
+    /**
+     * Android SleepPhaseConverter.aggregate30SecTo5Min: drop codes outside 1..4, cut
+     * into 10-epoch windows (last partial), skip windows < 5, AWAKE when >= 4 awake,
+     * else the most frequent stage, ties AWAKE > DEEP > REM > LIGHT.
+     * Mirrors `oura-summary::aggregate_30s_to_5min`.
+     */
+    fun aggregate5Min(stages: List<Int>): List<Int> {
+        val codes = stages.filter { it in 1..4 }
+        val out = ArrayList<Int>()
+        var i = 0
+        while (i < codes.size) {
+            val w = codes.subList(i, minOf(i + 10, codes.size))
+            i += 10
+            if (w.size < 5) continue
+            val counts = IntArray(5)
+            for (c in w) counts[c] += 1
+            if (counts[4] >= 4) { out.add(4); continue }
+            val top = (1..4).maxOf { counts[it] }
+            out.add(listOf(4, 1, 3, 2).first { counts[it] >= top })
+        }
+        return out
+    }
+
     /**
      * Mode filter over a centered odd window — removes single-epoch flicker so cycle /
      * awakening counts reflect real architecture, not 30 s noise. Ties resolve to the

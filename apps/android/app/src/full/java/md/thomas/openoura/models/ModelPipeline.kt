@@ -67,7 +67,7 @@ object ModelPipeline {
         if (readErr == null && events.isNotEmpty()) {
             log("models", "read ${events.size} events")
             val clock = EventStore.RingClock(events)
-            val rSleep = SleepStaging.run(context, base.nights, events, clock, progress = progress)
+            val rSleep = SleepStaging.run(context, base.nights, events, clock, profile, progress = progress)
             staged = rSleep.staged
             sleepErr = rSleep.error
 
@@ -101,17 +101,19 @@ object ModelPipeline {
         // transient read failure can't strip hypnograms that were already on screen.
         if (sleepErr != null && staged.isEmpty() && previous != null) {
             staged = previous.nights.mapNotNull { night ->
-                val sds = night.startDs ?: return@mapNotNull null
-                // Only SleepNet's own output — not the ring hypnogram the core supplies.
-                if (night.stagingSource != "sleepnet") return@mapNotNull null
+                // Only our own on-device staging — not the ring hypnogram the core supplies.
+                val source = night.stagingSource ?: return@mapNotNull null
+                if (!Sleep.isOuraStaging(source) && source != "signals" && source != "sleepnet") {
+                    return@mapNotNull null
+                }
                 val stages = night.stagesFull?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
-                sds.toString() to stages
+                night.stagingKey to stages
             }.toMap()
         }
 
         // Fold SleepNet's hypnogram + stage breakdown into each night, keyed by the exact
         // bedtime start_ds so two sleeps on one calendar day don't collide.
-        s = applySleepStages(staged, s)
+        s = applySleepStages(context, staged, s)
 
         s = when {
             cva != null -> s.copy(
@@ -139,33 +141,52 @@ object ModelPipeline {
     }
 
     /**
-     * Fold staged SleepNet output into the nights and refresh the debt window once the
-     * staged coverage is at least as large as the model-free one. Port of `Core.applySleepStages`
-     * in apps/ios/OuraApp/Core.swift.
+     * Fold the staged hypnogram (NSSA, or the signal estimate fallback) into the nights
+     * and refresh the debt window once the staged coverage is at least as large as the
+     * model-free one. Port of `Core.applySleepStages` in apps/ios/OuraApp/Core.swift.
      */
-    private fun applySleepStages(staged: Map<String, List<Int>>, summary: Summary): Summary {
+    private fun applySleepStages(
+        context: Context,
+        staged: Map<String, List<Int>>,
+        summary: Summary,
+    ): Summary {
+        // Source + first-epoch time of each staged night (NSSA, or the signal estimate).
+        val meta = SleepStaging.cachedEntries(context, summary.nights, summary.profile)
+        // Also load raw cache without windowKey validation as final fallback
+        val globalKey = ModelCacheStore.globalKey(context, summary.profile) + "|nssa"
+        val rawCache = ModelCacheStore.load(
+            context, ModelCacheStore.STAGING_FILE, globalKey, StagedNightEntry.serializer()
+        )
         var s = summary
         s = s.copy(
             nights = s.nights.map { night ->
-                val sds = night.startDs ?: return@map night
-                var stages = staged[sds.toString()] ?: return@map night
-                if (stages.isEmpty()) return@map night
-                // SleepNet has no staging for deep sleep; when a night carries none, restore
-                // the deep-sleep epochs from the ring's signal morphology, as the iOS app does.
-                if (stages.none { it == 1 }) {
+                // Priority: 1) staged this run, 2) validated cache (meta), 3) raw cache
+                val stages0 = staged[night.stagingKey]
+                    ?: meta[night.stagingKey]?.stages
+                    ?: rawCache[night.stagingKey]?.stages
+                    ?: return@map night
+                if (stages0.isEmpty()) return@map night
+                val entry = meta[night.stagingKey] ?: rawCache[night.stagingKey]
+                val source = entry?.source ?: "nssa"
+                var stages = stages0
+                // Oura's own hypnograms are used verbatim (oura-summary is_oura_staging);
+                // only the signal estimate gets the deep-sleep recovery.
+                if (!Sleep.isOuraStaging(source) && stages.none { it == 1 }) {
                     stages = Sleep.refineDeepStages(stages, night)
                 }
                 val total = stages.size.toDouble()
                 fun pct(code: Int) = (stages.count { it == code } / total * 100).roundToLong().toDouble()
                 val asleep = total - stages.count { it == 4 }
                 val complete = stages.all { it in 1..4 }
-                val autonomic = Sleep.autonomic(night, Sleep.smooth(stages, 5))
-                // Mirrors iOS Core.swift: SleepNet replaces the ring's hypnogram in BOTH the
-                // preview and the full-resolution field, so metrics can't read the old one.
+                val autonomic = Sleep.autonomic(night, night.analysisStages)
+                // The on-device hypnogram replaces the ring's in BOTH the preview and the
+                // full-resolution field, so metrics can't read the old one.
                 night.copy(
                     stages = stages,
                     stagesFull = stages,
-                    stagingSource = "sleepnet",
+                    stagingSource = source,
+                    stages5min = if (Sleep.isOuraStaging(source)) Sleep.aggregate5Min(stages) else null,
+                    stagesT0Unix = entry?.t0Unix,
                     stagingCompleteJson = complete,
                     stagingCoveragePct = stages.count { it in 1..4 } / total * 100,
                     deepPct = pct(1),
@@ -174,7 +195,7 @@ object ModelPipeline {
                     wakePct = pct(4),
                     efficiency = if (complete) (asleep / total * 100).roundToLong().toDouble() else null,
                     sleepScore = null,                                  // the core's score describes a different hypnogram
-                    autonomic = StageAutonomicJson(                     // mean HR/HRV per stage over the smoothed hypnogram
+                    autonomic = StageAutonomicJson(                     // mean HR/HRV per stage over the analysis hypnogram
                         hrvDeep = autonomic.hrvDeep,
                         hrvLight = autonomic.hrvLight,
                         hrvRem = autonomic.hrvRem,
@@ -223,18 +244,18 @@ object ModelPipeline {
                         return previous to "No sleep data is saved for this day."
                     }
                     val result = SleepStaging.run(
-                        context, listOf(night), events, clock,
+                        context, listOf(night), events, clock, base.profile,
                         force = true, pruneCache = false, progress = progress,
                     )
                     if (result.error != null) {
                         return previous to "Couldn't refresh sleep analysis: ${result.error}"
                     }
-                    val stages = result.staged[start.toString()]
+                    val stages = result.staged[night.stagingKey]
                     if (stages.isNullOrEmpty()) {
                         return previous to "Not enough saved sleep data to refresh this night."
                     }
                     s = s.replacingNight(day, night)
-                    s = applySleepStages(result.staged, s)
+                    s = applySleepStages(context, result.staged, s)
                 }
                 DayAnalysisKind.ACTIVITY -> {
                     if (base.activityProfile[day] == null) {

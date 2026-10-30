@@ -1,7 +1,9 @@
 // JNI bridge: run Oura's TorchScript models through the LibTorch lite interpreter on
-// Android. A direct port of apps/ios/OuraApp/TorchBridge.mm — same five entry points,
-// same input order, same output element indices — so the two native clients produce
-// bit-identical results from the same .ptl files. See docs/clients.md.
+// Android. A direct port of apps/ios/OuraApp/TorchBridge.mm — same entry points, same
+// input order, same output element indices — so the two native clients produce
+// bit-identical results from the same .ptl files. Sleep staging is NSSA
+// (sleepstaging_2_6_0), which additionally registers the oura_ops::* custom ops that
+// NssaOps.c implements. See docs/clients.md.
 //
 // The models bake their own preprocessing into the graph, so callers only supply raw
 // input tensors (built in the Kotlin models/*.kt files, mirroring the Swift ones).
@@ -12,11 +14,16 @@
 #include <android/log.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
+
+#include "NssaOps.h"
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "openoura.torch", __VA_ARGS__)
 
@@ -76,78 +83,175 @@ struct Utf8 {
 };
 } // namespace
 
+// ─── oura_ops custom ops for the NSSA stager (sleepstaging_2_6_0) ──────────────
+// Schemas match tools/nssa_ops.py; the .ptl calls them by name through the
+// dispatcher. The implementations are the shared NssaOps.c, exactly as on iOS.
+static std::mutex g_classifier_lock;
+static std::vector<uint8_t> g_classifier_blob;
+static std::string g_classifier_path;
+
+void oura_nssa_set_classifier_path(const char *path) {
+    std::lock_guard<std::mutex> lock(g_classifier_lock);
+    if (path && g_classifier_path != path) {
+        g_classifier_path = path;
+        g_classifier_blob.clear();
+    }
+}
+
+static const std::vector<uint8_t> &classifierBlob() {
+    std::lock_guard<std::mutex> lock(g_classifier_lock);
+    if (g_classifier_blob.empty() && !g_classifier_path.empty()) {
+        FILE *f = fopen(g_classifier_path.c_str(), "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) {
+                g_classifier_blob.resize((size_t)n);
+                if (fread(g_classifier_blob.data(), 1, (size_t)n, f) != (size_t)n) g_classifier_blob.clear();
+            }
+            fclose(f);
+        }
+    }
+    return g_classifier_blob;
+}
+
+static std::tuple<at::Tensor, at::Tensor> op_create_windows(const at::Tensor &timestamps, double window_s) {
+    auto ts = timestamps.reshape({-1}).to(at::kLong).contiguous();
+    const int64_t n_ts = ts.numel();
+    if (n_ts == 0) return {at::zeros({0, 1}, at::kLong), at::full({0, 4}, -1, at::kLong)};
+    const int64_t n = std::max<int64_t>(0, nssa_create_windows(ts.data_ptr<int64_t>(), n_ts, window_s, nullptr, nullptr));
+    auto wts = at::zeros({n}, at::kLong);
+    auto rows = at::full({n, 4}, -1, at::kLong);
+    if (n > 0) nssa_create_windows(ts.data_ptr<int64_t>(), n_ts, window_s, wts.data_ptr<int64_t>(), rows.data_ptr<int64_t>());
+    return {wts.reshape({-1, 1}), rows};
+}
+
+static at::Tensor op_find_indices(const at::Tensor &x, const at::Tensor &xnew) {
+    auto xs = x.reshape({-1}).to(at::kLong).contiguous();
+    auto vs = xnew.reshape({-1}).to(at::kLong).contiguous();
+    auto out = at::zeros({vs.numel()}, at::kLong);
+    if (nssa_find_indices(xs.data_ptr<int64_t>(), xs.numel(), vs.data_ptr<int64_t>(), vs.numel(),
+                          out.data_ptr<int64_t>()) != 0)
+        throw std::runtime_error("oura_find_indices: native code would read past x");
+    return out.reshape(xnew.sizes());
+}
+
+static at::Tensor op_biquad_cascade(const at::Tensor &sos, const at::Tensor &x) {
+    auto s = sos.to(at::kFloat).contiguous();
+    auto v = x.to(at::kFloat).reshape({-1}).contiguous();
+    auto out = at::empty_like(v);
+    if (s.size(0) > 64) throw std::runtime_error("oura_biquad_cascade: too many sections");
+    nssa_biquad_cascade(s.data_ptr<float>(), s.size(0), v.data_ptr<float>(), v.numel(), out.data_ptr<float>());
+    return out.reshape(x.sizes()).to(x.scalar_type());
+}
+
+static at::Tensor op_find_peaks(const at::Tensor &x) {
+    auto v = x.to(at::kFloat).reshape({-1}).contiguous();
+    auto out = at::zeros({std::max<int64_t>(v.numel() / 2, 1)}, at::kLong);
+    const int64_t m = nssa_find_peaks(v.data_ptr<float>(), v.numel(), out.data_ptr<int64_t>());
+    return out.slice(0, 0, m).clone();
+}
+
+static at::Tensor op_sleep_classifier(const at::Tensor &features) {
+    auto f = features.to(at::kFloat).contiguous();
+    if (f.dim() != 2 || f.size(1) != 182) throw std::runtime_error("oura_sleep_classifier expects [N,182]");
+    const auto &blob = classifierBlob();
+    if (blob.empty()) throw std::runtime_error("oura_sleep_classifier: classifier blob missing");
+    auto out = at::empty({f.size(0), 4}, at::kFloat);
+    if (f.size(0) > 0 &&
+        nssa_classifier_predict(blob.data(), (int64_t)blob.size(), f.data_ptr<float>(), f.size(0), f.size(1),
+                                out.data_ptr<float>()) != 0)
+        throw std::runtime_error("oura_sleep_classifier: bad classifier blob");
+    return out;
+}
+
+TORCH_LIBRARY(oura_ops, m) {
+    m.def("oura_create_windows(Tensor timestamps, float window_s) -> (Tensor, Tensor)", op_create_windows);
+    m.def("oura_find_indices(Tensor x, Tensor xnew) -> Tensor", op_find_indices);
+    m.def("oura_biquad_cascade(Tensor sos, Tensor x) -> Tensor", op_biquad_cascade);
+    m.def("oura_find_peaks(Tensor x) -> Tensor", op_find_peaks);
+    m.def("oura_sleep_classifier(Tensor features) -> Tensor", op_sleep_classifier);
+}
+
+// The lite build ships no Conjugate/Negative fallbacks, yet NSSA's graph routes a
+// few real-valued ops (numpy_T + mul in its smoothing) through those keys. Real
+// tensors never carry the conj/neg bits, so passing through is exact.
+TORCH_LIBRARY_IMPL(_, Conjugate, m) { m.fallback(torch::CppFunction::makeFallthrough()); }
+TORCH_LIBRARY_IMPL(_, Negative, m) { m.fallback(torch::CppFunction::makeFallthrough()); }
+
 extern "C" {
 
 /**
- * SleepNet (moonstone) → per-30s hypnogram stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE),
- * matching tools/run_sleep_model.py. Returns the stage array, or null on failure, and
- * writes each epoch's absolute Unix-ms END timestamp into `out_timestamps_ms` (which
- * bounds the epoch count) so the caller can place the output on its true 30 s grid.
+ * Oura's NSSA sleep stager (sleepstaging_2_6_0) over one ring bedtime — a port of
+ * TorchBridge.mm's oura_nssa, matching tools/nssa_stager.py. Inputs are built by the
+ * Kotlin NssaInputs (twin of tools/nssa_inputs.py): acmVal is row-major n×6
+ * [madIqr, madMax, madTmean, faIqr, faMax, faMean], ibiVal is n×3
+ * [ibi, amplitude, validity] (ecore-corrected), tempVal is n, demographics is
+ * [age, bmi, sex]. Returns the per-30s stage codes (1=DEEP 2=LIGHT 3=REM 4=WAKE),
+ * or null on failure, and writes each epoch's start stamp into `out_timestamps_ms`
+ * (which bounds the epoch count).
  */
 JNIEXPORT jintArray JNICALL
-Java_md_thomas_openoura_models_TorchBridge_sleepnet(
+Java_md_thomas_openoura_models_TorchBridge_nssa(
         JNIEnv *env, jobject, jstring model_path,
-        jlongArray ibi_ts, jfloatArray ibi_val,
-        jlongArray acm_ts, jfloatArray acm_val,
-        jlongArray temp_ts, jfloatArray temp_val,
+        jlongArray acm_ts, jfloatArray acm_val, jint n_acm,
+        jlongArray ibi_ts, jfloatArray ibi_val, jint n_ibi,
+        jlongArray temp_ts, jfloatArray temp_val, jint n_temp,
+        jfloatArray demographics,
         jlong bedtime_start_ms, jlong bedtime_end_ms,
-        jlongArray out_timestamps_ms) {
+        jlongArray out_timestamps_ms, jint max_out) {
     Utf8 path(env, model_path);
-    LongArr ibiTs(env, ibi_ts); FloatArr ibiVal(env, ibi_val);
     LongArr acmTs(env, acm_ts); FloatArr acmVal(env, acm_val);
+    LongArr ibiTs(env, ibi_ts); FloatArr ibiVal(env, ibi_val);
     LongArr tempTs(env, temp_ts); FloatArr tempVal(env, temp_val);
-    if (!path.p || ibiTs.n <= 0) return nullptr;
+    FloatArr demoArr(env, demographics);
+    if (!path.p || !demoArr.p || max_out <= 0 || n_acm <= 0 || n_ibi <= 0 || n_temp <= 0) return nullptr;
+    if ((int)acmTs.n < n_acm || (int)acmVal.n < 6 * n_acm || (int)ibiTs.n < n_ibi ||
+        (int)ibiVal.n < 3 * n_ibi || (int)tempTs.n < n_temp || (int)tempVal.n < n_temp) return nullptr;
+    if ((int)demoArr.n < 3 || env->GetArrayLength(out_timestamps_ms) < max_out) return nullptr;
 
-    std::lock_guard<std::mutex> lock(g_torch);
     try {
+        std::lock_guard<std::mutex> lock(g_torch);
         static std::unique_ptr<torch::jit::mobile::Module> cached;
         static std::string cachedPath;
         auto &m = cachedModule(path.str(), cached, cachedPath);
-
-        auto ibi_ts_t = blobLong((const int64_t *)ibiTs.p, ibiTs.n);
-        auto ibi_val_t = blobFloat2d(ibiVal.p, ibiTs.n, 3);
-        auto acm_ts_t = blobLong((const int64_t *)acmTs.p, acmTs.n);
-        auto acm_val_t = blobFloat2d(acmVal.p, acmTs.n, 1);
-        auto temp_ts_t = blobLong((const int64_t *)tempTs.p, tempTs.n);
-        auto temp_val_t = blobFloat2d(tempVal.p, tempTs.n, 1);
-
         int64_t bt[2] = {(int64_t)bedtime_start_ms, (int64_t)bedtime_end_ms};
-        auto bedtime = blobLong(bt, 2);
-        auto spo2_val = at::empty({0, 1}, at::kFloat);
-        auto spo2_ts = at::empty({0}, at::kLong);
-        float sc[5] = {35.f, 25.f, 0.f, 0.f, 0.f};
-        auto scalars = at::from_blob(sc, {5}, at::kFloat).clone();
-        float tstv[1] = {300.f};
-        auto tst = at::from_blob(tstv, {1}, at::kFloat).clone();
-
-        std::vector<c10::IValue> inputs{bedtime, ibi_val_t, ibi_ts_t, acm_val_t, acm_ts_t,
-                                        temp_val_t, temp_ts_t, spo2_val, spo2_ts, scalars, tst};
+        std::vector<c10::IValue> inputs{
+            blobFloat2d(acmVal.p, n_acm, 6), blobLong(acmTs.p, n_acm),
+            blobFloat2d(ibiVal.p, n_ibi, 3), blobLong(ibiTs.p, n_ibi),
+            at::from_blob((void *)tempVal.p, {n_temp}, at::kFloat).clone(), blobLong(tempTs.p, n_temp),
+            at::from_blob((void *)demoArr.p, {3}, at::kFloat).clone(), blobLong(bt, 2)};
         auto out = m.forward(inputs).toTuple();
-        auto staging = out->elements()[1].toTensor();   // [epochs, channels]
-        if (staging.dim() < 2 || staging.size(1) < 1) {
-            LOGE("sleepnet: unexpected staging shape");
+        auto stages = out->elements()[1].toTensor();               // [epochs, 1 + 4 probs]
+        if (stages.dim() < 2 || stages.size(1) < 1) {
+            LOGE("nssa: unexpected stage shape");
             return nullptr;
         }
-        auto col0 = staging.select(1, 0).to(at::kInt).contiguous();
+        auto col0 = stages.select(1, 0).to(at::kDouble).round().to(at::kInt).contiguous();
         auto timestamps = out->elements()[0].toTensor().to(at::kLong).reshape({-1}).contiguous();
-        if (timestamps.numel() != col0.numel()) {
-            LOGE("sleepnet: mismatched timestamps or output exceeds buffer");
+        if (timestamps.numel() != col0.numel() || (int64_t)col0.numel() > max_out) {
+            LOGE("nssa: mismatched timestamps or output exceeds buffer");
             return nullptr;
         }
-        jsize n = (jsize)col0.numel();
-        if (n > env->GetArrayLength(out_timestamps_ms)) {
-            LOGE("sleepnet: timestamps exceed output buffer");
-            return nullptr;
-        }
+        const int n = (int)col0.numel();
         env->SetLongArrayRegion(out_timestamps_ms, 0, n, (const jlong *)timestamps.data_ptr<int64_t>());
         jintArray result = env->NewIntArray(n);
         if (!result) return nullptr;
         env->SetIntArrayRegion(result, 0, n, (const jint *)col0.data_ptr<int>());
         return result;
     } catch (const std::exception &e) {
-        LOGE("sleepnet: %s", e.what());
+        LOGE("nssa: %s", e.what());
         return nullptr;
     }
+}
+
+/** Point `oura_ops::oura_sleep_classifier` at the bundled forest (see
+ *  tools/extract_nssa_classifier.py). Must be called before the first nssa() run. */
+JNIEXPORT void JNICALL
+Java_md_thomas_openoura_models_TorchBridge_nssaSetClassifierPath(JNIEnv *env, jobject, jstring path) {
+    Utf8 p(env, path);
+    oura_nssa_set_classifier_path(p.str().c_str());
 }
 
 /**

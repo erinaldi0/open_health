@@ -53,8 +53,20 @@ data class ActivityDayEntry(
     val failed: Boolean = false,
 )
 
+/**
+ * One cached staged night. `windowKey` ties the cells to the summary window they were
+ * mapped onto (missing in older caches → those entries simply recompute); `source` is
+ * "nssa" (Oura's sleepstaging model) or "signals" (our estimate when NSSA cannot run);
+ * `t0Unix` is the wall-clock start (unix s) of the first NSSA epoch.
+ */
 @Serializable
-data class StagedNightEntry(val fp: String, val stages: List<Int>)
+data class StagedNightEntry(
+    val fp: String,
+    val stages: List<Int>,
+    val windowKey: String? = null,
+    val source: String? = null,
+    val t0Unix: Double? = null,
+)
 
 @Serializable
 private data class ModelCacheFile<E>(
